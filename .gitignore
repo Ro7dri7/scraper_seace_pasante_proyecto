@@ -1,0 +1,19 @@
+# Python
+venv/
+.venv/
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+
+# Secrets / tokens (no subir)
+token.txt
+.env
+*.pem
+
+# Runtime / locales (opcionales; descomenta si no quieres versionarlos)
+# seace.db
+# fichas/
+# *.json
+# *.xml
