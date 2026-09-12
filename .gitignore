@@ -11,9 +11,18 @@ __pycache__/
 token.txt
 .env
 *.pem
+handoff_state.json
 
-# Runtime / locales (opcionales; descomenta si no quieres versionarlos)
-# seace.db
-# fichas/
-# *.json
-# *.xml
+# Runtime / datos locales
+seace.db
+fichas/
+*.html
+nuevas.json
+resultados_barrido.json
+resultados_pagina1.json
+seace_delta_resumen.json
+respuesta_test.xml
+respuesta_pagina*.xml
+error_get.html
+ficha_post_error.html
+buscador_probe.html

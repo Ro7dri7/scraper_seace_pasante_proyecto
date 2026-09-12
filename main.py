@@ -3,66 +3,107 @@ SEACE PROD2 — listado HTTP (PrimeFaces AJAX) + SQLite incremental.
 
 Modos:
   backfill → ventana fija (FECHA_INICIO/FIN), barra todas las páginas.
-  sync     → ventana corta desde la DB (rápido, solo detecta nuevas).
+  sync     → ventana corta desde fecha_max OECE / DB hasta hoy (delta).
 
-tokenBusProSel: pegar fresco en token.txt antes de cada corrida.
+reCAPTCHA: 2Captcha (TWOCAPTCHA_API_KEY). Las fichas se abren en la
+misma página del listado, antes de paginar, para no invalidar el ViewState.
 """
 from __future__ import annotations
 
 from pathlib import Path
+import argparse
 import json
 import math
+import os
 import re
 import sqlite3
+import sys
 import time
 import warnings
 from datetime import date, datetime, timedelta, timezone
 
+_PIPELINE_DIR = Path(os.environ.get("PIPELINE_DIR") or r"C:\extraccion_oesce\pipeline")
+if _PIPELINE_DIR.exists() and str(_PIPELINE_DIR) not in sys.path:
+    sys.path.insert(0, str(_PIPELINE_DIR))
+
 import requests
 from bs4 import BeautifulSoup, XMLParsedAsHTMLWarning
 
+from captcha_2captcha import (
+    CaptchaError,
+    CaptchaZeroBalance,
+    extraer_action_v3,
+    extraer_sitekey,
+    resolver_recaptcha,
+)
+from lib_nomenclatura import normalizar_nomenclatura
+
 warnings.filterwarnings("ignore", category=XMLParsedAsHTMLWarning)
+
+
+def _env(name, default=""):
+    val = os.environ.get(name)
+    if val is None:
+        return default
+    return val.strip()
+
+
+def _env_int(name, default=None):
+    raw = _env(name, "")
+    if raw == "":
+        return default
+    return int(raw)
+
+
+def _env_float(name, default):
+    raw = _env(name, "")
+    if raw == "":
+        return default
+    return float(raw)
+
+
+def _env_bool(name, default=False):
+    raw = _env(name, "")
+    if raw == "":
+        return default
+    return raw.lower() in ("1", "true", "yes", "y", "si", "sí", "on")
+
 
 FORM = "tbBuscador:idFormBuscarProceso"
 DT = f"{FORM}:dtProcesos"
-HOST = "https://prod2.seace.gob.pe"
-ALFRESCO = "https://alfprod.seace.gob.pe/alfresco"
-IP_CLIENTE = "179.43.89.146"
-TOKEN_FILE = Path(__file__).with_name("token.txt")
-DB_FILE = Path(__file__).with_name("seace.db")
-NUEVAS_FILE = Path(__file__).with_name("nuevas.json")
+HOST = _env("SEACE_HOST", "https://prod2.seace.gob.pe")
+ALFRESCO = _env("SEACE_ALFRESCO", "https://alfprod.seace.gob.pe/alfresco")
+IP_CLIENTE = _env("SEACE_IP_CLIENTE", "")
+TOKEN_FILE = Path(_env("SEACE_TOKEN_FILE") or Path(__file__).with_name("token.txt"))
+DB_FILE = Path(_env("SEACE_DB_FILE") or Path(__file__).with_name("seace.db"))
+NUEVAS_FILE = Path(_env("SEACE_NUEVAS_FILE") or Path(__file__).with_name("nuevas.json"))
 
-# --- Modo ---
-# "backfill" = carga histórica de la ventana fija (una vez).
-# "sync"     = incremental diario/horario (minutos).
-MODO = "sync"
+MODO = _env("SEACE_MODO", "sync")
+ANIO = _env("SEACE_YEAR", "2026")
+FECHA_INICIO = _env("SEACE_FECHA_INICIO", "01/08/2026")
+FECHA_FIN = _env("SEACE_FECHA_FIN", "31/08/2026")
+VERSION_SEACE = _env("SEACE_VERSION", "Seace 3")
+_OBJETO_RAW = _env("SEACE_OBJETO", "")
+OBJETO = _OBJETO_RAW or None
 
-# --- Filtros ---
-ANIO = "2026"
-FECHA_INICIO = "01/08/2026"   # solo backfill (o fallback si DB vacía)
-FECHA_FIN = "31/08/2026"
-VERSION_SEACE = "Seace 3"
-# "Bien" | "Obra" | "Consultoría de Obra" | "Servicio" | None
-OBJETO = "Servicio"
+DIAS_LOOKBACK = _env_int("SEACE_DIAS_LOOKBACK", 3)
+DIAS_SOLAPE = _env_int("SEACE_DIAS_SOLAPE", 1)
 
-# --- Sync: ventana hacia atrás desde hoy / desde max(fecha) en DB ---
-DIAS_LOOKBACK = 3
-DIAS_SOLAPE = 1
+ROWS = _env_int("SEACE_ROWS", 20)
+SLEEP_SEC = _env_float("SEACE_SLEEP_SEC", 1.2)
+MAX_PAGES = _env_int("SEACE_MAX_PAGES", None)
+GUARDAR_XML_PAGINAS = _env_bool("SEACE_GUARDAR_XML", False)
 
-# --- Paginación / ritmo ---
-ROWS = 20
-SLEEP_SEC = 1.2
-MAX_PAGES = None
-GUARDAR_XML_PAGINAS = False
-
-# --- Ficha / descarga ---
-PROBAR_FICHA = False
-PROBAR_DESCARGA = False
-# Tras sync/backfill: abrir ficha y bajar docs solo de nids nuevos
-PROCESAR_FICHAS_NUEVAS = True
-MAX_FICHAS_POR_CORRIDA = 5   # tope por corrida (respeta servidor); None = todas las nuevas
-FICHA_DIR = Path(__file__).with_name("fichas")
-ARCHIVOS_DIR = FICHA_DIR / "archivos"
+PROBAR_FICHA = _env_bool("SEACE_PROBAR_FICHA", False)
+PROBAR_DESCARGA = _env_bool("SEACE_PROBAR_DESCARGA", False)
+PROCESAR_FICHAS_NUEVAS = _env_bool("SEACE_PROCESAR_FICHAS", True)
+MAX_FICHAS_POR_CORRIDA = _env_int("SEACE_MAX_FICHAS", None)
+FICHA_DIR = Path(_env("SEACE_FICHA_DIR") or Path(__file__).with_name("fichas"))
+ARCHIVOS_DIR = Path(_env("SEACE_ARCHIVOS_DIR") or (FICHA_DIR / "archivos"))
+HANDOFF_DEFAULT = _env(
+    "OECE_HANDOFF_FILE",
+    str(Path(r"C:\extraccion_oesce\pipeline\handoff_state.json")),
+)
 
 
 # ---------------------------------------------------------------------------
@@ -84,6 +125,7 @@ class Seace:
         })
         self._vs = None
         self.filtros = {}
+        self.sitekey = None
         self.refresh()
 
     def refresh(self):
@@ -95,7 +137,11 @@ class Seace:
             Path("error_get.html").write_text(r.text, encoding="utf-8")
             raise ValueError("No se pudo obtener el ViewState inicial.")
         self._vs = vs["value"]
+        self.page_html = r.text
+        self.sitekey = extraer_sitekey(r.text) or _env("SEACE_RECAPTCHA_SITEKEY")
         print(f"[+] ViewState: {self._vs[:20]}...")
+        if self.sitekey:
+            print(f"[+] reCAPTCHA v3 sitekey: {self.sitekey[:16]}...")
 
     def find_select(self, option_label):
         form = self.soup.find("form", id=FORM)
@@ -275,6 +321,10 @@ class Seace:
             self.page, data=data, headers=headers,
             allow_redirects=False, timeout=120,
         )
+        ficha_markers = ("tbFicha:dtDocumentos", "fichaSeleccion", "dtDocumentos_data")
+        if r.status_code == 200 and any(m in (r.text or "") for m in ficha_markers):
+            return r.url or self.page, r.text
+
         if r.status_code not in (301, 302, 303, 307, 308):
             Path("ficha_post_error.html").write_text(r.text or "", encoding="utf-8")
             raise RuntimeError(
@@ -349,14 +399,95 @@ class Seace:
 # ---------------------------------------------------------------------------
 # Parseo
 # ---------------------------------------------------------------------------
-def load_token():
-    if not TOKEN_FILE.exists():
-        raise SystemExit(f"[-] Falta {TOKEN_FILE.name} — pega tokenBusProSel de DevTools")
-    token = TOKEN_FILE.read_text(encoding="utf-8").strip()
+def detectar_ip_publica():
+    global IP_CLIENTE
+    if IP_CLIENTE:
+        print(f"[+] IP pública (SEACE_IP_CLIENTE): {IP_CLIENTE}")
+        return IP_CLIENTE
+    try:
+        ip = requests.get("https://api.ipify.org", timeout=10).text.strip()
+        if ip:
+            IP_CLIENTE = ip
+            print(f"[+] IP pública: {IP_CLIENTE}")
+    except Exception as e:
+        print(f"[!] No se pudo detectar IP pública ({e}); se usa {IP_CLIENTE or 'vacío'}")
+    return IP_CLIENTE
+
+
+def obtener_token_recaptcha(seace):
+    html = getattr(seace, "page_html", "") or ""
+    sitekey = (
+        _env("SEACE_RECAPTCHA_SITEKEY")
+        or seace.sitekey
+        or extraer_sitekey(html)
+    )
+    if not sitekey:
+        raise SystemExit(
+            "[-] No se encontró sitekey de reCAPTCHA v3. "
+            "Revisa SEACE_RECAPTCHA_SITEKEY en .env"
+        )
+    action = _env("SEACE_RECAPTCHA_ACTION") or extraer_action_v3(html)
+    try:
+        token = resolver_recaptcha(
+            sitekey,
+            seace.page,
+            version=_env("SEACE_RECAPTCHA_VERSION", "v3"),
+            action=action,
+            min_score=float(_env("SEACE_RECAPTCHA_MIN_SCORE", "0.3") or 0.3),
+        )
+    except CaptchaZeroBalance as e:
+        raise SystemExit(f"[-] {e}") from e
+    except CaptchaError as e:
+        raise SystemExit(f"[-] Error 2Captcha: {e}") from e
     if len(token) < 100:
-        raise SystemExit("[-] token.txt vacío/incompleto")
-    print(f"[+] Token len={len(token)}")
+        raise SystemExit("[-] Token 2Captcha incompleto")
+    print(f"[+] Token reCAPTCHA listo (len={len(token)})")
     return token
+
+
+def cargar_nomenclaturas_oece(path):
+    known = set()
+    if not path:
+        return known
+    p = Path(path)
+    if not p.exists():
+        print(f"[!] Handoff OECE no existe: {p}")
+        return known
+    if p.suffix.lower() == ".json":
+        data = json.loads(p.read_text(encoding="utf-8"))
+        items = data.get("nomenclaturas_norm") or data.get("nomenclaturas") or []
+        if isinstance(items, dict):
+            items = list(items.keys())
+        for item in items:
+            n = normalizar_nomenclatura(item)
+            if n:
+                known.add(n)
+    else:
+        for line in p.read_text(encoding="utf-8").splitlines():
+            n = normalizar_nomenclatura(line)
+            if n:
+                known.add(n)
+    print(f"[+] Nomenclaturas OECE cargadas para deduplicar: {len(known)}")
+    try:
+        from supabase_sync import nomenclaturas_en_nube
+        cloud = nomenclaturas_en_nube()
+        known |= cloud
+        print(f"[+] Nomenclaturas en Supabase: {len(cloud)} (unión={len(known)})")
+    except Exception as e:
+        print(f"[!] No se pudieron leer nomenclaturas de Supabase: {e}")
+    return known
+
+
+def fecha_iso_a_seace(s):
+    if not s:
+        return None
+    s = s.strip()
+    for fmt in ("%Y-%m-%d", "%d/%m/%Y"):
+        try:
+            return datetime.strptime(s[:10], fmt).strftime("%d/%m/%Y")
+        except ValueError:
+            continue
+    return s
 
 
 def _fragmento_grilla(xml_response):
@@ -454,6 +585,7 @@ def parse_resultados(xml_response):
             "entidad": tds[1].get_text(" ", strip=True),
             "fecha_publicacion": tds[2].get_text(" ", strip=True),
             "nomenclatura": tds[3].get_text(" ", strip=True),
+            "nomenclatura_norm": normalizar_nomenclatura(tds[3].get_text(" ", strip=True)),
             "reiniciado_desde": tds[4].get_text(" ", strip=True),
             "objeto": tds[5].get_text(" ", strip=True),
             "descripcion": tds[6].get_text(" ", strip=True),
@@ -499,16 +631,23 @@ def parse_documentos(ficha_html):
         tds = tr.find_all("td", recursive=False)
         if len(tds) < 4:
             continue
-        file_id = tipo = nombre = source = None
+        file_id = tipo = nombre = source = file_code = None
         for a in tr.find_all("a"):
             oc = a.get("onclick") or ""
+            href = a.get("href") or ""
             m = re.search(
                 r"descargaDocGeneral\('([^']*)','([^']*)','([^']*)'\)", oc
             )
             if m:
                 file_id, tipo, nombre = m.group(1), m.group(2), m.group(3)
                 source = a.get("id")
+            mcode = re.search(r"fileCode=([A-Za-z0-9_\-]+)", oc + " " + href)
+            if mcode:
+                file_code = mcode.group(1)
+            if m:
                 break
+        if not file_id and file_code:
+            file_id = file_code
         if not file_id:
             continue
         etapa = tds[1].get_text(" ", strip=True)
@@ -518,6 +657,7 @@ def parse_documentos(ficha_html):
             "etapa": etapa,
             "documento": documento,
             "file_id": file_id,
+            "file_code": file_code or file_id,
             "tipo": tipo,
             "nombre_archivo": nombre,
             "fuente": source,
@@ -527,25 +667,61 @@ def parse_documentos(ficha_html):
     return docs
 
 
+EXCLUSIONES_DOC = (
+    "acta de absolucion", "acta de absolución", "absolucion", "absolución",
+    "postergacion", "postergación", "constancia",
+    "acta de evaluacion", "acta de evaluación", "buena pro",
+    "subsanacion", "subsanación", "presentacion de propuesta",
+    "presentación de propuesta",
+)
+
+
 def clasificar_documento(etapa, documento, nombre_archivo):
     """Clasifica doc publicado en ficha (puede no existir aún si el proceso sigue abierto)."""
     blob = " ".join(
         x.lower() for x in (etapa or "", documento or "", nombre_archivo or "")
     )
+    if any(k in blob for k in EXCLUSIONES_DOC):
+        return "excluido"
+    if "bases integradas" in blob:
+        return "bases_integradas"
+    if "bases administrativas" in blob or (
+        "base" in blob and ("administrativ" in blob or "estandar" in blob or "estándar" in blob)
+    ):
+        return "bases_administrativas"
+    if "resumen ejecutivo" in blob:
+        return "resumen_ejecutivo"
     if any(k in blob for k in (
-        "presentacion de propuesta", "presentación de propuesta",
         "documentos de presentacion", "documentos de presentación",
         "presentacion_de_propuestas", "presentación de ofertas",
         "presentacion de ofertas",
     )):
         return "presentacion_propuestas"
-    if "base" in blob and ("administrativ" in blob or "estandar" in blob or "estándar" in blob):
-        return "bases"
     if blob.strip().startswith("convocatoria") and "base" in blob:
-        return "bases"
+        return "bases_administrativas"
     if "base" in blob:
-        return "bases"
+        return "bases_administrativas"
     return "otro"
+
+
+def elegir_documento_prioridad(docs):
+    """Bases Integradas > Bases Administrativas > Resumen Ejecutivo. Ignora actas."""
+    prioridad = {
+        "bases_integradas": 100,
+        "bases_administrativas": 50,
+        "resumen_ejecutivo": 20,
+    }
+    mejor = None
+    mejor_score = 0
+    for d in docs:
+        cat = d.get("categoria") or clasificar_documento(
+            d.get("etapa"), d.get("documento"), d.get("nombre_archivo")
+        )
+        d["categoria"] = cat
+        score = prioridad.get(cat, 0)
+        if score > mejor_score:
+            mejor, mejor_score = d, score
+    return mejor
 
 
 # ---------------------------------------------------------------------------
@@ -584,6 +760,10 @@ def db_connect():
         ("docs_propuestas_ok", "INTEGER DEFAULT 0"),
         ("docs_propuestas_pendiente", "INTEGER DEFAULT 1"),
         ("proxima_revision", "TEXT"),
+        ("nomenclatura_norm", "TEXT"),
+        ("fuente", "TEXT"),
+        ("url_bases", "TEXT"),
+        ("file_code", "TEXT"),
     ):
         if col not in cols:
             conn.execute(f"ALTER TABLE licitaciones ADD COLUMN {col} {typ}")
@@ -603,6 +783,9 @@ def db_connect():
             FOREIGN KEY(nid_convocatoria) REFERENCES licitaciones(nid_convocatoria)
         )
         """
+    )
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_lic_nom_norm ON licitaciones(nomenclatura_norm)"
     )
     conn.execute(
         "CREATE INDEX IF NOT EXISTS idx_lic_fecha ON licitaciones(fecha_publicacion)"
@@ -655,14 +838,16 @@ def sync_incremental(conn, filas):
         exists = conn.execute(
             "SELECT 1 FROM licitaciones WHERE nid_convocatoria=?", (nid,)
         ).fetchone()
+        nom_norm = f.get("nomenclatura_norm") or normalizar_nomenclatura(f.get("nomenclatura"))
+        f["nomenclatura_norm"] = nom_norm
         conn.execute(
             """
             INSERT INTO licitaciones (
                 nid_convocatoria, nomenclatura, entidad, fecha_publicacion,
                 objeto, descripcion, vr_ve_cuantia, moneda, version_seace,
-                nid_proceso, nid_sistema,
+                nid_proceso, nid_sistema, nomenclatura_norm, fuente,
                 first_seen, last_seen
-            ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)
+            ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
             ON CONFLICT(nid_convocatoria) DO UPDATE SET
                 nomenclatura=excluded.nomenclatura,
                 entidad=excluded.entidad,
@@ -674,6 +859,7 @@ def sync_incremental(conn, filas):
                 version_seace=excluded.version_seace,
                 nid_proceso=excluded.nid_proceso,
                 nid_sistema=excluded.nid_sistema,
+                nomenclatura_norm=excluded.nomenclatura_norm,
                 last_seen=excluded.last_seen
             """,
             (
@@ -681,6 +867,7 @@ def sync_incremental(conn, filas):
                 f["objeto"], f["descripcion"], f["vr_ve_cuantia"], f["moneda"],
                 f["version_seace"],
                 f.get("nid_proceso"), f.get("nid_sistema"),
+                nom_norm, f.get("fuente") or "seace",
                 now, now,
             ),
         )
@@ -710,69 +897,149 @@ def resolver_ventana(conn):
     return ini.strftime("%d/%m/%Y"), hoy.strftime("%d/%m/%Y")
 
 
-def barrer_listado(seace, conn, token, fecha_ini, fecha_fin):
-    """Buscar + paginar toda la ventana. Devuelve (todas_filas, nuevas, total_servidor)."""
-    xml = seace.buscar(token, ANIO, fecha_ini, fecha_fin, VERSION_SEACE, OBJETO)
-    Path("respuesta_test.xml").write_text(xml, encoding="utf-8")
-
+def _buscar_pagina(seace, token_holder, fecha_ini, fecha_fin, page_idx, anio, version, objeto):
+    """GET fresco + buscar + saltar a page_idx. Renueva captcha si el listado viene vacío."""
+    xml = seace.buscar(token_holder[0], anio, fecha_ini, fecha_fin, version, objeto)
     filas, total = parse_resultados(xml)
-    print(f"[*] Página búsqueda: {len(filas)} filas | total servidor={total}")
+    if page_idx == 0:
+        time.sleep(SLEEP_SEC)
+        xml0 = seace.paginar(0, ROWS)
+        filas0, total0 = parse_resultados(xml0)
+        if filas0:
+            filas, total = filas0, (total0 or total)
+    elif page_idx > 0:
+        time.sleep(SLEEP_SEC)
+        xml = seace.paginar(page_idx * ROWS, ROWS)
+        filas_p, total_p = parse_resultados(xml)
+        if filas_p:
+            filas, total = filas_p, (total_p or total)
+    if not filas and page_idx == 0:
+        print("[!] Listado vacío — renovando reCAPTCHA...")
+        seace.refresh()
+        token_holder[0] = obtener_token_recaptcha(seace)
+        xml = seace.buscar(token_holder[0], anio, fecha_ini, fecha_fin, version, objeto)
+        filas, total = parse_resultados(xml)
+        time.sleep(SLEEP_SEC)
+        xml0 = seace.paginar(0, ROWS)
+        filas0, total0 = parse_resultados(xml0)
+        if filas0:
+            filas, total = filas0, (total0 or total)
+    return filas, total
+
+
+def barrer_listado(seace, conn, token, fecha_ini, fecha_fin, known_oece=None,
+                   anio=None, version=None, objeto=None, max_fichas=None):
+    """
+    Busca el delta y, en CADA página, abre fichas nuevas ANTES de paginar.
+    Así el ViewState del listado sigue vivo para el POST de Ficha (302).
+    Tras cada ficha (sale del buscador) se restaura la misma página.
+    """
+    known_oece = known_oece or set()
+    anio = anio or ANIO
+    version = version or VERSION_SEACE
+    token_holder = [token]
+    fichas_ok = 0
+    fichas_hechas = set()
+
+    filas, total = _buscar_pagina(
+        seace, token_holder, fecha_ini, fecha_fin, 0, anio, version, objeto
+    )
+    Path("respuesta_test.xml").write_text("", encoding="utf-8")
+    print(f"[*] Página 1: {len(filas)} filas | total servidor={total}")
     if not filas and total == 0:
         return [], [], 0
-
-    # Forzar ROWS en el paginador (el buscar suele dejar 15)
-    time.sleep(SLEEP_SEC)
-    xml0 = seace.paginar(0, ROWS)
-    filas0, total0 = parse_resultados(xml0)
-    if filas0:
-        filas, total = filas0, (total0 or total)
-        print(f"[*] Re-página 1 con rows={ROWS}: {len(filas)} filas | total={total}")
-    elif not filas:
-        return [], [], 0
-
-    todas = []
-    nuevas_all = []
-    nuevas = sync_incremental(conn, filas)
-    todas.extend(filas)
-    nuevas_all.extend(nuevas)
-    print(f"[+] pág.1 +{len(nuevas)} nuevas")
 
     pages = math.ceil(total / ROWS) if total else 1
     if MAX_PAGES is not None:
         pages = min(pages, MAX_PAGES)
-    print(f"[*] Barrido 2..{pages} (rows={ROWS}, sleep={SLEEP_SEC}s)")
+    print(f"[*] Barrido 1..{pages} con ficha-antes-de-paginar (rows={ROWS})")
 
-    # Early-stop en sync: N páginas seguidas sin nuevas
-    racha_sin_nuevas = 0
-    EARLY_STOP = 2 if MODO == "sync" else None
+    todas = []
+    nuevas_all = []
+    page_idx = 0
 
-    for page_idx in range(1, pages):
-        first = page_idx * ROWS
-        time.sleep(SLEEP_SEC)
-        print(f"[*] paginar first={first} ({page_idx + 1}/{pages})...")
-        xml_p = seace.paginar(first, ROWS)
-        if GUARDAR_XML_PAGINAS:
-            Path(f"respuesta_pagina{page_idx + 1}.xml").write_text(xml_p, encoding="utf-8")
-        filas_p, _ = parse_resultados(xml_p)
-        if not filas_p:
+    while page_idx < pages:
+        if page_idx > 0 and not filas:
+            filas, total = _buscar_pagina(
+                seace, token_holder, fecha_ini, fecha_fin, page_idx, anio, version, objeto
+            )
+        if not filas:
             print(f"[-] Página {page_idx + 1} vacía — stop")
             break
-        nuevas_p = sync_incremental(conn, filas_p)
-        todas.extend(filas_p)
-        nuevas_all.extend(nuevas_p)
-        print(
-            f"  +{len(filas_p)} filas | +{len(nuevas_p)} nuevas | "
-            f"N° {filas_p[0]['n']}..{filas_p[-1]['n']}"
-        )
-        if EARLY_STOP is not None:
-            if nuevas_p:
-                racha_sin_nuevas = 0
-            else:
-                racha_sin_nuevas += 1
-                if racha_sin_nuevas >= EARLY_STOP:
-                    print(f"[*] Early-stop sync: {EARLY_STOP} páginas sin novedades")
-                    break
 
+        nuevas = sync_incremental(conn, filas)
+        todas.extend(filas)
+        nuevas_all.extend(nuevas)
+        nuevas_nids = {f.get("nid_convocatoria") for f in nuevas if f.get("nid_convocatoria")}
+        print(f"[+] pág.{page_idx + 1} +{len(nuevas)} nuevas en DB")
+
+        if PROCESAR_FICHAS_NUEVAS:
+            for fila in list(filas):
+                nid = fila.get("nid_convocatoria")
+                nom = fila.get("nomenclatura_norm") or normalizar_nomenclatura(fila.get("nomenclatura"))
+                if nom and nom in known_oece:
+                    fila["fuente"] = "ambos"
+                    if nid:
+                        conn.execute(
+                            "UPDATE licitaciones SET fuente=? WHERE nid_convocatoria=?",
+                            ("ambos", nid),
+                        )
+                    print(f"  [=] Duplicado OECE/Supabase (omitir ficha): {fila.get('nomenclatura')}")
+                    continue
+                fila["fuente"] = "seace"
+                try:
+                    from supabase_sync import upsert_seace_fila
+                    upsert_seace_fila(fila)
+                except Exception as e:
+                    print(f"  [!] Supabase listado: {e}")
+                if not nid or nid in fichas_hechas:
+                    continue
+                if nid not in nuevas_nids:
+                    ya = conn.execute(
+                        "SELECT docs_bases_ok FROM licitaciones WHERE nid_convocatoria=?",
+                        (nid,),
+                    ).fetchone()
+                    if ya and ya[0]:
+                        continue
+                if max_fichas is not None and fichas_ok >= max_fichas:
+                    break
+                try:
+                    print(f"[*] Ficha inmediata {fila.get('nomenclatura')}...")
+                    procesar_ficha_y_docs(seace, fila, conn)
+                    fichas_hechas.add(nid)
+                    fichas_ok += 1
+                except Exception as e:
+                    print(f"  [-] Error ficha {fila.get('nomenclatura')}: {e}")
+                    fichas_hechas.add(nid)
+                # Volver al listado (el POST de ficha invalidó el ViewState)
+                seace.refresh()
+                filas, total = _buscar_pagina(
+                    seace, token_holder, fecha_ini, fecha_fin, page_idx, anio, version, objeto
+                )
+                pages = math.ceil(total / ROWS) if total else pages
+                if MAX_PAGES is not None:
+                    pages = min(pages, MAX_PAGES)
+
+        if max_fichas is not None and fichas_ok >= max_fichas:
+            print(f"[*] Tope de fichas alcanzado ({max_fichas})")
+            break
+
+        page_idx += 1
+        if page_idx >= pages:
+            break
+        time.sleep(SLEEP_SEC)
+        print(f"[*] paginar first={page_idx * ROWS} ({page_idx + 1}/{pages})...")
+        xml_p = seace.paginar(page_idx * ROWS, ROWS)
+        if GUARDAR_XML_PAGINAS:
+            Path(f"respuesta_pagina{page_idx + 1}.xml").write_text(xml_p, encoding="utf-8")
+        filas, _ = parse_resultados(xml_p)
+        if not filas:
+            seace.refresh()
+            filas, total = _buscar_pagina(
+                seace, token_holder, fecha_ini, fecha_fin, page_idx, anio, version, objeto
+            )
+
+    conn.commit()
     return todas, nuevas_all, total
 
 
@@ -820,27 +1087,33 @@ def procesar_ficha_y_docs(seace, fila, conn=None):
     )
 
     docs = parse_documentos(html)
+    elegido = elegir_documento_prioridad(docs)
     cats = {d["categoria"] for d in docs}
-    tiene_bases = "bases" in cats
+    tiene_bases = bool(elegido)
     tiene_prop = "presentacion_propuestas" in cats
-    # Si el proceso sigue abierto, ese doc simplemente no aparece en dtDocumentos
     prop_pendiente = 0 if tiene_prop else 1
 
     print(
         f"  docs={len(docs)} "
-        f"(bases={'sí' if tiene_bases else 'no'}, "
+        f"(prioridad={elegido['categoria'] if elegido else 'ninguna'}, "
         f"propuestas={'sí' if tiene_prop else 'PENDIENTE'}) | {url}"
     )
 
     guardados = []
-    for d in docs:
-        etiqueta = d.get("documento") or d.get("nombre_archivo")
-        print(f"    [{d['categoria']}] {etiqueta}")
+    url_bases = ""
+    file_code = ""
+    if elegido:
+        etiqueta = elegido.get("documento") or elegido.get("nombre_archivo")
+        file_code = elegido.get("file_code") or elegido.get("file_id") or ""
+        url_bases = f"{ALFRESCO}/downloadDoc?fileCode={file_code}" if file_code else ""
+        print(f"    [{elegido['categoria']}] {etiqueta} fileCode={file_code}")
         time.sleep(SLEEP_SEC)
-        path, nbytes, _ = seace.descargar_documento(
-            d["file_id"], d.get("nombre_archivo"), sub
+        path, nbytes, file_url = seace.descargar_documento(
+            elegido["file_id"], elegido.get("nombre_archivo"), sub
         )
+        url_bases = file_url or url_bases
         print(f"      → {path.name} ({nbytes} bytes)")
+        print(f"      URL: {url_bases}")
         guardados.append(str(path))
         if conn and nid:
             conn.execute(
@@ -856,8 +1129,8 @@ def procesar_ficha_y_docs(seace, fila, conn=None):
                     categoria=excluded.categoria
                 """,
                 (
-                    d["file_id"], nid, d["categoria"], d.get("etapa"),
-                    d.get("documento"), d.get("nombre_archivo"),
+                    elegido["file_id"], nid, elegido["categoria"], elegido.get("etapa"),
+                    elegido.get("documento"), elegido.get("nombre_archivo"),
                     str(path), nbytes, now,
                 ),
             )
@@ -873,7 +1146,9 @@ def procesar_ficha_y_docs(seace, fila, conn=None):
                 docs_bases_ok=?,
                 docs_propuestas_ok=?,
                 docs_propuestas_pendiente=?,
-                proxima_revision=?
+                proxima_revision=?,
+                url_bases=?,
+                file_code=?
             WHERE nid_convocatoria=?
             """,
             (
@@ -882,10 +1157,29 @@ def procesar_ficha_y_docs(seace, fila, conn=None):
                 1 if tiene_prop else 0,
                 prop_pendiente,
                 prox,
+                url_bases,
+                file_code,
                 nid,
             ),
         )
         conn.commit()
+
+    try:
+        from supabase_sync import upsert_documento, upsert_seace_fila
+        nom_norm = upsert_seace_fila(fila, extra={
+            "ficha_url": url,
+            "url_bases": url_bases,
+            "file_code": file_code,
+        })
+        if elegido and nom_norm:
+            upsert_documento(
+                nom_norm, elegido,
+                url_descarga=url_bases,
+                ruta_local=guardados[0] if guardados else "",
+                nbytes=(Path(guardados[0]).stat().st_size if guardados else None),
+            )
+    except Exception as e:
+        print(f"  [!] Supabase ficha: {e}")
 
     return url, guardados
 
@@ -893,67 +1187,60 @@ def procesar_ficha_y_docs(seace, fila, conn=None):
 # ---------------------------------------------------------------------------
 # main
 # ---------------------------------------------------------------------------
+def parse_args():
+    p = argparse.ArgumentParser(description="Delta SEACE (JSF) desde fecha_max OECE hasta hoy")
+    p.add_argument("--desde", help="Fecha inicio DD/MM/YYYY o YYYY-MM-DD (posta OECE)")
+    p.add_argument("--hasta", help="Fecha fin (default: hoy)")
+    p.add_argument("--year", default=ANIO)
+    p.add_argument("--objeto", default=OBJETO, help="Bien|Obra|Servicio|Consultoría de Obra. Vacío=todos")
+    p.add_argument("--nomenclaturas-file", default=HANDOFF_DEFAULT or None, help="JSON/TXT de nomenclaturas OECE para deduplicar")
+    p.add_argument("--max-fichas", type=int, default=MAX_FICHAS_POR_CORRIDA)
+    p.add_argument("--modo", default=MODO, choices=("sync", "backfill"))
+    return p.parse_args()
+
+
 if __name__ == "__main__":
+    args = parse_args()
+    detectar_ip_publica()
+    known_oece = cargar_nomenclaturas_oece(args.nomenclaturas_file)
+    objeto = args.objeto
+    if objeto is not None and objeto.strip() == "":
+        objeto = None
+
+    if not args.desde and args.nomenclaturas_file:
+        hp = Path(args.nomenclaturas_file)
+        if hp.exists() and hp.suffix.lower() == ".json":
+            try:
+                h = json.loads(hp.read_text(encoding="utf-8"))
+                args.desde = h.get("fecha_max_seace") or h.get("fecha_max")
+                print(f"[*] fecha_max desde handoff: {args.desde}")
+            except Exception as e:
+                print(f"[!] No se pudo leer fecha del handoff: {e}")
+
     print(
-        f"=== SEACE | MODO={MODO} | ROWS={ROWS} | "
-        f"FICHAS_NUEVAS={PROCESAR_FICHAS_NUEVAS} | max={MAX_FICHAS_POR_CORRIDA} ==="
+        f"=== SEACE | MODO={args.modo} | ROWS={ROWS} | "
+        f"FICHAS_EN_PAGINA=True | max={args.max_fichas or 'ilimitado'} ==="
     )
-    token = load_token()
     conn = db_connect()
     print(f"[*] DB {DB_FILE.name}: {db_count(conn)} registros")
 
-    fecha_ini, fecha_fin = resolver_ventana(conn)
+    if args.desde:
+        fecha_ini = fecha_iso_a_seace(args.desde)
+        fecha_fin = fecha_iso_a_seace(args.hasta) if args.hasta else date.today().strftime("%d/%m/%Y")
+        print(f"[*] Ventana delta (posta OECE): {fecha_ini} .. {fecha_fin}")
+    else:
+        fecha_ini, fecha_fin = resolver_ventana(conn)
+
     seace = Seace()
+    token = obtener_token_recaptcha(seace)
 
-    if PROBAR_DESCARGA:
-        ficha_path = FICHA_DIR / "ficha_test.html"
-        if ficha_path.exists():
-            html = ficha_path.read_text(encoding="utf-8", errors="replace")
-            print(f"[*] Usando ficha local {ficha_path}")
-        else:
-            xml = seace.buscar(token, ANIO, fecha_ini, fecha_fin, VERSION_SEACE, OBJETO)
-            filas, _ = parse_resultados(xml)
-            if not filas:
-                filas, _ = parse_resultados(seace.paginar(0, ROWS))
-            fila = next((f for f in filas if f.get("ficha_source")), None)
-            if not fila:
-                raise SystemExit("[-] Sin fila/ficha para descarga")
-            time.sleep(SLEEP_SEC)
-            _url, html = seace.abrir_ficha(fila)
-            FICHA_DIR.mkdir(exist_ok=True)
-            ficha_path.write_text(html, encoding="utf-8")
-
-        docs = parse_documentos(html)
-        print(f"[*] Documentos en ficha: {len(docs)}")
-        if not docs:
-            raise SystemExit("[-] No hay descargaDocGeneral en la ficha")
-        for d in docs:
-            print(f"  - {d.get('documento') or d['nombre_archivo']} | id={d['file_id'][:8]}...")
-            time.sleep(SLEEP_SEC)
-            path, nbytes, url = seace.descargar_documento(
-                d["file_id"], d.get("nombre_archivo"), ARCHIVOS_DIR
-            )
-            print(f"    → {path.name} ({nbytes} bytes)")
-        print(f"[+] Listo. Archivos en {ARCHIVOS_DIR}")
-        raise SystemExit(0)
-
-    if PROBAR_FICHA:
-        xml = seace.buscar(token, ANIO, fecha_ini, fecha_fin, VERSION_SEACE, OBJETO)
-        Path("respuesta_test.xml").write_text(xml, encoding="utf-8")
-        filas, total = parse_resultados(xml)
-        if not filas:
-            time.sleep(SLEEP_SEC)
-            filas, total = parse_resultados(seace.paginar(0, ROWS))
-        fila = next((f for f in filas if f.get("ficha_source")), None)
-        if not fila:
-            raise SystemExit("[-] Sin ficha_source")
-        url, html = seace.abrir_ficha(fila)
-        FICHA_DIR.mkdir(exist_ok=True)
-        (FICHA_DIR / "ficha_test.html").write_text(html, encoding="utf-8")
-        print(f"[+] Ficha OK → {url}")
-        raise SystemExit(0)
-
-    todas, nuevas, total = barrer_listado(seace, conn, token, fecha_ini, fecha_fin)
+    todas, nuevas, total = barrer_listado(
+        seace, conn, token, fecha_ini, fecha_fin,
+        known_oece=known_oece,
+        anio=str(args.year),
+        objeto=objeto,
+        max_fichas=args.max_fichas,
+    )
 
     NUEVAS_FILE.write_text(
         json.dumps(nuevas, ensure_ascii=False, indent=2), encoding="utf-8"
@@ -961,32 +1248,21 @@ if __name__ == "__main__":
     Path("resultados_barrido.json").write_text(
         json.dumps(todas, ensure_ascii=False, indent=2), encoding="utf-8"
     )
+    Path("seace_delta_resumen.json").write_text(
+        json.dumps({
+            "fecha_ini": fecha_ini,
+            "fecha_fin": fecha_fin,
+            "vistas": len(todas),
+            "nuevas": len(nuevas),
+            "duplicados_oece": sum(1 for f in todas if f.get("fuente") == "ambos"),
+            "solo_seace": sum(1 for f in todas if f.get("fuente") != "ambos"),
+            "db": db_count(conn),
+        }, ensure_ascii=False, indent=2),
+        encoding="utf-8",
+    )
 
     print("---")
     print(f"[+] Vistas: {len(todas)} | servidor≈{total} | nuevas={len(nuevas)} | DB={db_count(conn)}")
-
-    if PROCESAR_FICHAS_NUEVAS and nuevas:
-        cola = nuevas
-        if MAX_FICHAS_POR_CORRIDA is not None:
-            cola = nuevas[:MAX_FICHAS_POR_CORRIDA]
-        print(f"[*] Procesando fichas/docs de {len(cola)}/{len(nuevas)} nuevas...")
-        for i, meta in enumerate(cola):
-            nid = meta.get("nid_convocatoria")
-            try:
-                if i == 0 and meta.get("ficha_source"):
-                    # Tras el listado el ViewState del buscador sigue vivo
-                    fila = meta
-                else:
-                    seace.refresh()
-                    fila = buscar_fila_en_listado(
-                        seace, token, nid, fecha_ini, fecha_fin
-                    )
-                if not fila or not fila.get("ficha_source"):
-                    print(f"  [-] No se reubicó {meta.get('nomenclatura')}")
-                    continue
-                procesar_ficha_y_docs(seace, fila, conn)
-            except Exception as e:
-                print(f"  [-] Error {meta.get('nomenclatura')}: {e}")
-        print(f"[+] Archivos en {ARCHIVOS_DIR}")
-    elif PROCESAR_FICHAS_NUEVAS:
-        print("[*] Sin nuevas → no hay fichas que abrir (sync incremental OK).")
+    print(f"[+] Duplicados OECE (nomenclatura): {sum(1 for f in todas if f.get('fuente') == 'ambos')}")
+    print(f"[+] Solo SEACE (delta): {sum(1 for f in todas if f.get('fuente') != 'ambos')}")
+    print(f"[+] Archivos en {ARCHIVOS_DIR}")
