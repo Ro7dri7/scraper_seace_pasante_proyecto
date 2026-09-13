@@ -22,10 +22,6 @@ import time
 import warnings
 from datetime import date, datetime, timedelta, timezone
 
-_PIPELINE_DIR = Path(os.environ.get("PIPELINE_DIR") or r"C:\extraccion_oesce\pipeline")
-if _PIPELINE_DIR.exists() and str(_PIPELINE_DIR) not in sys.path:
-    sys.path.insert(0, str(_PIPELINE_DIR))
-
 import requests
 from bs4 import BeautifulSoup, XMLParsedAsHTMLWarning
 
@@ -100,10 +96,14 @@ PROCESAR_FICHAS_NUEVAS = _env_bool("SEACE_PROCESAR_FICHAS", True)
 MAX_FICHAS_POR_CORRIDA = _env_int("SEACE_MAX_FICHAS", None)
 FICHA_DIR = Path(_env("SEACE_FICHA_DIR") or Path(__file__).with_name("fichas"))
 ARCHIVOS_DIR = Path(_env("SEACE_ARCHIVOS_DIR") or (FICHA_DIR / "archivos"))
-HANDOFF_DEFAULT = _env(
-    "OECE_HANDOFF_FILE",
-    str(Path(r"C:\extraccion_oesce\pipeline\handoff_state.json")),
-)
+_handoff_raw = _env("OECE_HANDOFF_FILE", "")
+if _handoff_raw:
+    _handoff_path = Path(_handoff_raw)
+    if not _handoff_path.is_absolute():
+        _handoff_path = Path(__file__).resolve().parent / _handoff_path
+    HANDOFF_DEFAULT = str(_handoff_path)
+else:
+    HANDOFF_DEFAULT = str(Path(__file__).with_name("handoff_state.json"))
 
 
 # ---------------------------------------------------------------------------

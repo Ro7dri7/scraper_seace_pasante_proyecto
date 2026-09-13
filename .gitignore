@@ -12,6 +12,7 @@ token.txt
 .env
 *.pem
 handoff_state.json
+*_handoff.json
 
 # Runtime / datos locales
 seace.db
@@ -26,3 +27,9 @@ respuesta_pagina*.xml
 error_get.html
 ficha_post_error.html
 buscador_probe.html
+
+# Salidas OECE / pipeline
+prospectos_seace_*.csv
+prospectos_seace_*.xlsx
+cache_contactos_rnp.json
+cache_ubicaciones_sunat.json

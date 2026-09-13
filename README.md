@@ -1,35 +1,59 @@
-# Scraper SEACE (HTTP / browserless)
+# Scraper SEACE + OECE (proyecto unificado)
 
-Extractor de licitaciones públicas de **SEACE PROD2** (`prod2.seace.gob.pe`) vía requests + BeautifulSoup, sin Playwright.
+Todo corre en este directorio: extracción masiva OECE (API), enriquecimiento RNP/SUNAT, delta SEACE con 2Captcha, deduplicación por nomenclatura y sync a Supabase.
 
-## Qué hace
+## Qué incluye
 
-1. **Listado** — búsqueda y paginación PrimeFaces/JSF (formulario `tbBuscador:idFormBuscarProceso`).
-2. **Sync incremental** — modos `backfill` / `sync` con SQLite (`seace.db`).
-3. **Ficha de selección** — POST completo → redirect a `fichaSeleccion.xhtml`.
-4. **Documentos** — descarga Bases y Documentos de Presentación de Propuestas vía Alfresco (`downloadDoc` JSONP + ticket).
+1. **OECE** — descarga CSV mensual, leads/postores, handoff (`handoff_state.json`).
+2. **RNP / SUNAT** — teléfonos, emails, ubicación fiscal.
+3. **SEACE PROD2** — listado HTTP + reCAPTCHA vía 2Captcha + fichas/Alfresco.
+4. **Dedup** — nomenclaturas OECE + las ya subidas a Supabase.
+5. **Supabase** — upsert a `convocatorias`, `proveedores`, `documentos_proceso`.
 
 ## Setup
 
-```bash
+```powershell
+cd C:\scraper_licitigo\scraper_seace_pasante_proyecto
 python -m venv venv
-# Windows
-.\venv\Scripts\activate
+.\venv\Scripts\Activate.ps1
 pip install -r requirements.txt
+copy .env.example .env
 ```
 
-Coloca un token fresco de reCAPTCHA en `token.txt` (campo `tokenBusProSel`). El token expira; hay que renovarlo periódicamente.
+Completa en `.env`:
+- `TWOCAPTCHA_API_KEY`
+- `SUPABASE_URL` + `SUPABASE_SECRET_KEY`
+
+Si las tablas de Supabase son stubs, ejecuta una vez `schema_supabase.sql` en el SQL Editor.
 
 ## Uso
 
-Edita la configuración al inicio de `main.py` (`MODO`, fechas, objeto contractual, flags de fichas) y ejecuta:
+Pipeline completo (OECE → enriquecimiento → delta SEACE):
 
-```bash
+```powershell
+python pipeline_seace.py --year 2026 --month 09
+```
+
+Solo OECE (sin SEACE):
+
+```powershell
+python pipeline_seace.py --year 2026 --month 09 --skip-seace
+```
+
+Prueba SEACE con tope de fichas:
+
+```powershell
+python pipeline_seace.py --year 2026 --month 09 --max-fichas-seace 3
+```
+
+Solo delta SEACE (requiere `handoff_state.json` local):
+
+```powershell
 python main.py
 ```
 
 ## Notas
 
-- No subas `token.txt` al repositorio.
-- `venv/` y `__pycache__/` están en `.gitignore`.
-- Los PDFs en `fichas/archivos/` son ejemplos de corridas de prueba.
+- No subas `.env`, `token.txt` ni `handoff_state.json`.
+- `OECE_HANDOFF_FILE=handoff_state.json` apunta a este mismo proyecto.
+- Ya no hace falta `C:\extraccion_oesce\pipeline`.

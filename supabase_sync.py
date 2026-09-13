@@ -41,8 +41,6 @@ def _load_env_file(path: Path):
 def load_env():
     here = Path(__file__).resolve().parent
     _load_env_file(here / ".env")
-    _load_env_file(Path(r"C:\scraper_licitigo\scraper_seace_pasante_proyecto\.env"))
-    _load_env_file(Path(r"C:\extraccion_oesce\pipeline\.env"))
 
 
 load_env()
