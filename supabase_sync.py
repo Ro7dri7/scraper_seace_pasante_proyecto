@@ -1,4 +1,11 @@
-"""Cliente Supabase: upsert a convocatorias / documentos_proceso / proveedores."""
+"""
+Cliente Supabase: upsert a convocatorias / documentos_proceso / items_proceso /
+proveedores.
+
+Estrategia on-demand: aquí NUNCA se descarga un binario. De cada documento se
+persiste el file_code y la URL de descarga de Alfresco; el PDF/ZIP se resuelve
+asíncronamente cuando el usuario desbloquea la licitación en el frontend.
+"""
 from __future__ import annotations
 
 import os
@@ -46,6 +53,29 @@ def load_env():
 load_env()
 
 BATCH = 200
+
+# Estado inicial del análisis IA: la ficha nace bloqueada y se procesa on-demand.
+ESTADO_ISO_BLOQUEADO = "Bloqueado"
+
+
+def _alfresco_base():
+    return (
+        os.environ.get("SEACE_ALFRESCO") or "https://alfprod.seace.gob.pe/alfresco"
+    ).strip().rstrip("/")
+
+
+def construir_url_alfresco(file_code):
+    """
+    URL dinámica de descarga (no se invoca aquí). Es el resolver JSONP de
+    Alfresco: devuelve un downloadUrl con alf_ticket fresco, así que la URL
+    guardada no caduca y sirve para el desbloqueo posterior.
+    """
+    if not file_code:
+        return ""
+    return (
+        f"{_alfresco_base()}/service/osce/downloadDoc"
+        f"?id={file_code}&doc={file_code}&guest=false"
+    )
 
 
 def get_client():
@@ -205,38 +235,47 @@ def upsert_seace_fila(fila, extra=None):
     return nom_norm
 
 
-def upsert_documento(nom_norm, doc, url_descarga="", ruta_local="", nbytes=None):
+def documento_row(nom_norm, doc):
+    """Fila on-demand: file_code + URL Alfresco. Nunca ruta local ni bytes."""
     file_id = doc.get("file_id") or doc.get("file_code")
     if not file_id or not nom_norm:
-        return
-    upsert_rows(
-        "documentos_proceso",
-        [{
-            "file_id": file_id,
-            "nomenclatura_norm": nom_norm,
-            "categoria": doc.get("categoria") or "",
-            "documento": doc.get("documento") or "",
-            "nombre_archivo": doc.get("nombre_archivo") or "",
-            "url_descarga": url_descarga or "",
-            "ruta_local": str(ruta_local or ""),
-            "bytes": nbytes,
-            "updated_at": _now(),
-        }],
-        "file_id",
-    )
+        return None
+    file_code = doc.get("file_code") or file_id
+    return {
+        "file_id": file_id,
+        "nomenclatura_norm": nom_norm,
+        "categoria": doc.get("categoria") or "",
+        "documento": doc.get("documento") or "",
+        "nombre_archivo": doc.get("nombre_archivo") or "",
+        "file_code": file_code,
+        "url_descarga": doc.get("url_descarga") or construir_url_alfresco(file_code),
+        "updated_at": _now(),
+    }
 
 
-def nomenclaturas_en_nube():
+def upsert_documentos(nom_norm, docs):
+    """Registra todos los documentos de una ficha sin descargar ningún binario."""
+    rows = []
+    vistos = set()
+    for doc in docs or []:
+        row = documento_row(nom_norm, doc)
+        if not row or row["file_id"] in vistos:
+            continue
+        vistos.add(row["file_id"])
+        rows.append(row)
+    return upsert_rows("documentos_proceso", rows, "file_id")
+
+
+def nomenclaturas_en_nube(fuente=None):
+    """Set de nomenclaturas normalizadas ya cargadas (llave de deduplicación)."""
     client = get_client()
     known = set()
     start = 0
     while True:
-        res = (
-            client.table("convocatorias")
-            .select("nomenclatura_norm")
-            .range(start, start + 999)
-            .execute()
-        )
+        q = client.table("convocatorias").select("nomenclatura_norm")
+        if fuente:
+            q = q.eq("fuente", fuente)
+        res = q.range(start, start + 999).execute()
         data = res.data or []
         for row in data:
             if row.get("nomenclatura_norm"):
@@ -245,3 +284,113 @@ def nomenclaturas_en_nube():
             break
         start += 1000
     return known
+
+
+def contar_convocatorias(fuente=None):
+    client = get_client()
+    q = client.table("convocatorias").select("nomenclatura_norm", count="exact")
+    if fuente:
+        q = q.eq("fuente", fuente)
+    res = q.limit(1).execute()
+    return res.count or 0
+
+
+# ---------------------------------------------------------------------------
+# PROD6 — Compras Menores (<= 8 UIT), API REST pública sin CAPTCHA
+# ---------------------------------------------------------------------------
+def convocatoria_from_prod6(cab, resumen=None):
+    """
+    Mapea uitContratoCompletoProjection (+ fila del buscador) a convocatorias.
+    La llave sigue siendo nomenclatura_norm (nroDescripcion normalizado).
+    """
+    resumen = resumen or {}
+    nom_raw = (cab.get("nroDescripcion") or resumen.get("desContratacion") or "").strip()
+    nom_norm = normalizar_nomenclatura(nom_raw)
+    if not nom_norm:
+        return None
+    id_contrato = cab.get("idContrato") or resumen.get("idContrato")
+    monto = (
+        cab.get("montoContrato")
+        if cab.get("montoContrato") is not None
+        else resumen.get("montoContrato")
+    )
+    # requiere_iso se omite a propósito: lo pone el DEFAULT en el INSERT y así
+    # un re-upsert no pisa el estado de desbloqueo del usuario.
+    return {
+        "nomenclatura_norm": nom_norm,
+        "nomenclatura": nom_raw,
+        "entidad": cab.get("nomEntidad") or resumen.get("nomEntidad") or "",
+        "fecha_publicacion": _fecha_iso(
+            cab.get("fecPublica") or resumen.get("fecPublica")
+        ),
+        "objeto": cab.get("nomObjetoContrato") or resumen.get("nomObjetoContrato") or "",
+        "descripcion": (
+            cab.get("desObjetoContrato") or resumen.get("desObjetoContrato") or ""
+        ),
+        "monto": "" if monto is None else str(monto),
+        "moneda": "PEN",
+        "fuente": "PROD6",
+        "estado": cab.get("nomEstadoContrato") or resumen.get("nomEstadoContrato") or "",
+        "id_contrato": None if id_contrato is None else str(id_contrato),
+        "fecha_fin_cotizacion": _fecha_iso(resumen.get("fecFinCotizacion")),
+        "ficha_url": (
+            f"https://prod6.seace.gob.pe/compras-menores/detalle/{id_contrato}"
+            if id_contrato
+            else ""
+        ),
+        "url_bases": "",
+        "file_code": None,
+        "updated_at": _now(),
+    }
+
+
+def items_from_prod6(nom_norm, items):
+    filas = []
+    for i, it in enumerate(items or [], start=1):
+        filas.append({
+            "nomenclatura_norm": nom_norm,
+            "secuencia": i,
+            "id_contrato_item": it.get("idContratoItem"),
+            "codigo_cubso": it.get("codCubso") or "",
+            "nombre_cubso": it.get("nomCubso") or "",
+            "descripcion_item": it.get("descripcionItem") or "",
+            "cantidad": it.get("cantidad"),
+            "unidad_medida": it.get("nomUnidadMedida") or "",
+            "distrito": it.get("nomDistritoExt") or it.get("nomDistrito") or "",
+            "moneda": it.get("nomMoneda") or "",
+            "precio_total": it.get("precioTotal"),
+            "updated_at": _now(),
+        })
+    return filas
+
+
+def upsert_prod6_proceso(cab, resumen=None, items=None):
+    """Inserta una compra menor + sus ítems. Devuelve nomenclatura_norm o None."""
+    conv = convocatoria_from_prod6(cab, resumen)
+    if not conv:
+        return None
+    if not upsert_rows("convocatorias", [conv], "nomenclatura_norm"):
+        return None
+    filas = items_from_prod6(conv["nomenclatura_norm"], items)
+    if filas:
+        upsert_rows("items_proceso", filas, "nomenclatura_norm,secuencia")
+    return conv["nomenclatura_norm"]
+
+
+def upsert_prod6_lote(procesos):
+    """
+    procesos: lista de dicts {cab, resumen, items}. Hace el upsert en bloque
+    (convocatorias primero por la FK de items_proceso).
+    """
+    convs, items, vistos = [], [], set()
+    for p in procesos:
+        conv = convocatoria_from_prod6(p.get("cab") or {}, p.get("resumen"))
+        if not conv or conv["nomenclatura_norm"] in vistos:
+            continue
+        vistos.add(conv["nomenclatura_norm"])
+        convs.append(conv)
+        items.extend(items_from_prod6(conv["nomenclatura_norm"], p.get("items")))
+    ok = upsert_rows("convocatorias", convs, "nomenclatura_norm")
+    if items:
+        upsert_rows("items_proceso", items, "nomenclatura_norm,secuencia")
+    return ok, len(items)

@@ -1,12 +1,15 @@
 """
-Pipeline unificado OECE + SEACE (todo en este mismo proyecto).
+Pipeline OECE (bulk histórico) + delta SEACE PROD2.
 
 Pasos:
   1) Extracción masiva OECE (API CSV)
   2) Contactos RNP
   3) Centralización
   4) Ubicación SUNAT
-  5) Delta SEACE (2Captcha + dedup nomenclaturas + Supabase)
+  5) Delta SEACE PROD2 (2Captcha + dedup nomenclaturas + Supabase)
+
+El flujo maestro de las 3 fuentes (OECE → PROD2 → PROD6) vive en main.py, que
+invoca este pipeline con --skip-seace para la parte OECE.
 """
 from __future__ import annotations
 
@@ -158,7 +161,7 @@ def main():
             else:
                 cmd = [
                     py,
-                    "main.py",
+                    "scraper_prod2.py",
                     "--desde",
                     str(fecha_max),
                     "--year",
@@ -172,7 +175,7 @@ def main():
                     cmd.extend(["--max-fichas", str(args.max_fichas_seace)])
                 run_step(
                     5,
-                    f"Delta SEACE desde {fecha_max} hasta hoy (dedup + Supabase)",
+                    f"Delta SEACE PROD2 desde {fecha_max} hasta hoy (dedup + Supabase)",
                     cmd,
                 )
 

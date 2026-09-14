@@ -21,6 +21,21 @@ alter table public.convocatorias add column if not exists nid_convocatoria text;
 alter table public.convocatorias add column if not exists nid_proceso text;
 alter table public.convocatorias add column if not exists updated_at timestamptz default now();
 
+-- PROD6 (Compras Menores <= 8 UIT, API REST)
+alter table public.convocatorias add column if not exists id_contrato text;
+alter table public.convocatorias add column if not exists estado text;
+alter table public.convocatorias add column if not exists fecha_fin_cotizacion timestamptz;
+
+-- Estrategia on-demand: el análisis IA arranca bloqueado y solo se dispara
+-- cuando el usuario desbloquea la licitación en el frontend.
+-- Los scrapers NO escriben esta columna: el DEFAULT la llena en el INSERT y
+-- el upsert posterior no pisa el estado de desbloqueo.
+alter table public.convocatorias
+  add column if not exists requiere_iso text default 'Bloqueado';
+alter table public.convocatorias
+  alter column requiere_iso set default 'Bloqueado';
+update public.convocatorias set requiere_iso = 'Bloqueado' where requiere_iso is null;
+
 -- Si la PK no es nomenclatura_norm, hay que recrear. Caso típico: tabla stub vacía.
 do $$
 begin
@@ -47,21 +62,48 @@ begin
       file_code text,
       nid_convocatoria text,
       nid_proceso text,
+      id_contrato text,
+      estado text,
+      fecha_fin_cotizacion timestamptz,
+      requiere_iso text default 'Bloqueado',
       updated_at timestamptz default now()
     );
   end if;
 end $$;
 
+-- Documentos: solo metadatos + URL dinámica de Alfresco. El binario NO se
+-- descarga en el scraping; se resuelve on-demand al desbloquear la ficha.
 create table if not exists public.documentos_proceso (
   file_id text primary key,
   nomenclatura_norm text not null references public.convocatorias(nomenclatura_norm) on delete cascade,
   categoria text,
   documento text,
   nombre_archivo text,
+  file_code text,
   url_descarga text,
-  ruta_local text,
-  bytes bigint,
   updated_at timestamptz default now()
+);
+
+alter table public.documentos_proceso add column if not exists file_code text;
+-- Legado del modo "descarga masiva": ya nadie escribe estas columnas.
+alter table public.documentos_proceso drop column if exists ruta_local;
+alter table public.documentos_proceso drop column if exists bytes;
+
+-- Ítems de compras menores (uitContratoItemProjectionList de PROD6)
+create table if not exists public.items_proceso (
+  nomenclatura_norm text not null references public.convocatorias(nomenclatura_norm) on delete cascade,
+  secuencia int not null,
+  id_contrato_item bigint,
+  codigo_cubso text,
+  nombre_cubso text,
+  descripcion_item text,
+  cantidad numeric,
+  unidad_medida text,
+  distrito text,
+  moneda text,
+  precio_total numeric,
+  updated_at timestamptz default now(),
+  primary key (nomenclatura_norm, secuencia)
 );
 
 create table if not exists public.proveedores (
@@ -77,7 +119,9 @@ create table if not exists public.proveedores (
 
 create index if not exists idx_conv_fecha on public.convocatorias (fecha_publicacion desc);
 create index if not exists idx_conv_fuente on public.convocatorias (fuente);
+create index if not exists idx_conv_requiere_iso on public.convocatorias (requiere_iso);
 create index if not exists idx_prov_ruc on public.proveedores (ruc);
+create index if not exists idx_items_cubso on public.items_proceso (codigo_cubso);
 
 -- Exponer a PostgREST (API)
 notify pgrst, 'reload schema';
