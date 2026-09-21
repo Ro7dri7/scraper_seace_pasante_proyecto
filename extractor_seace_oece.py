@@ -36,12 +36,46 @@ HEADERS = {
 BASE_API = "https://contratacionesabiertas.oece.gob.pe/api/v1"
 
 
+def _load_env_file(path: Path):
+    if not path.exists():
+        return
+    for line in path.read_text(encoding="utf-8").splitlines():
+        line = line.strip()
+        if not line or line.startswith("#"):
+            continue
+        if "=" not in line:
+            continue
+        k, v = line.split("=", 1)
+        os.environ.setdefault(k.strip(), v.strip().strip('"').strip("'"))
+
+
+_load_env_file(Path(__file__).resolve().parent / ".env")
+
+PROXY_USER = (os.environ.get("PROXY_USER") or "").strip()
+PROXY_PASS = (os.environ.get("PROXY_PASS") or "").strip()
+PROXY_HOST = (os.environ.get("PROXY_HOST") or "").strip()
+PROXY_PORT = (os.environ.get("PROXY_PORT") or "").strip()
+_proxy_user = urllib.parse.quote(PROXY_USER, safe="")
+_proxy_pass = urllib.parse.quote(PROXY_PASS, safe="")
+PROXY_URL = f"http://{_proxy_user}:{_proxy_pass}@{PROXY_HOST}:{PROXY_PORT}"
+
+
+def _opener_con_proxy():
+    """Opener urllib que sale siempre por el proxy residencial del .env."""
+    proxy_handler = urllib.request.ProxyHandler({
+        "http": PROXY_URL,
+        "https": PROXY_URL,
+    })
+    https_handler = urllib.request.HTTPSHandler(context=SSL_CONTEXT)
+    return urllib.request.build_opener(proxy_handler, https_handler)
+
+
 def get_latest_available_package():
     """Consulta la API de OECE para obtener el año y mes del dump más reciente."""
     url = f"{BASE_API}/files?page=1&paginateBy=5&format=json"
     req = urllib.request.Request(url, headers=HEADERS)
     try:
-        with urllib.request.urlopen(req, context=SSL_CONTEXT, timeout=20) as resp:
+        with _opener_con_proxy().open(req, timeout=20) as resp:
             data = json.loads(resp.read().decode('utf-8'))
             results = data.get("results", [])
             for item in results:
@@ -62,7 +96,8 @@ def download_zip(year, month):
     print(f"    URL: {url}")
     
     req = urllib.request.Request(url, headers=HEADERS)
-    with urllib.request.urlopen(req, context=SSL_CONTEXT, timeout=60) as resp:
+    opener = _opener_con_proxy()
+    with opener.open(req, timeout=60) as resp:
         content = resp.read()
         print(f"[+] Descarga completada. Tamaño: {len(content) / (1024*1024):.2f} MB")
         return zipfile.ZipFile(io.BytesIO(content))

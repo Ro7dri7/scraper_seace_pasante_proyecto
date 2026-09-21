@@ -33,6 +33,8 @@ from supabase_sync import (
     upsert_prod6_lote,
 )
 
+LOTE_UPSERT = 100
+
 load_env()
 
 
@@ -355,26 +357,47 @@ def ejecutar(anio=None, max_paginas=None, max_detalles=None, full=False,
             if i % 25 == 0 or i == len(candidatos):
                 print(f"    detalle {i}/{len(candidatos)} (fallidos={fallidos})")
 
-    # Paso D: upsert por lotes (convocatorias + items_proceso)
+    # Paso D: upsert por lotes (convocatorias primero, luego hijas).
+    # cronograma_proceso no existe en este Supabase: no se mapea ni se inserta.
+    from supabase_sync import convocatoria_from_prod6, items_from_prod6
+
+    procesos_validos = []
+    noms_lote = set()
+    for p in procesos:
+        conv = convocatoria_from_prod6(
+            p["cab"], p.get("resumen"), etapas=p.get("etapas"), docs=p.get("docs")
+        )
+        if not conv or not conv.get("nomenclatura_norm"):
+            continue
+        nom = conv["nomenclatura_norm"]
+        if nom in noms_lote:
+            continue
+        noms_lote.add(nom)
+        p = dict(p)
+        p["nomenclatura_norm"] = nom
+        procesos_validos.append(p)
+    omitidos_sin_nom = len(procesos) - len(procesos_validos)
+    if omitidos_sin_nom:
+        print(
+            f"[!] PROD6: {omitidos_sin_nom} procesos sin nomenclatura_norm "
+            "válida — no se upsertan hijas huérfanas"
+        )
+    procesos = procesos_validos
+
     insertados = 0
     items_total = 0
     if dry_run:
-        from supabase_sync import (
-            convocatoria_from_prod6,
-            cronograma_from_prod6,
-            items_from_prod6,
-        )
-
         print("[*] DRY-RUN: no se escribe en Supabase. Muestra del mapeo:")
         for p in procesos[:3]:
             conv = convocatoria_from_prod6(
                 p["cab"], p["resumen"], etapas=p.get("etapas"), docs=p.get("docs")
             )
             n_items = len(items_from_prod6(conv["nomenclatura_norm"], p["items"]))
-            crono = cronograma_from_prod6(conv["nomenclatura_norm"], p.get("etapas"))
+            # cronograma_proceso no existe aún — se omite el mapeo/upsert.
+            # crono = cronograma_from_prod6(conv["nomenclatura_norm"], p.get("etapas"))
             print(json.dumps(conv, ensure_ascii=False, indent=2))
-            print(f"    items={n_items} etapas={len(crono)} docs={len(p.get('docs') or [])}")
-            print(json.dumps(crono, ensure_ascii=False, indent=2))
+            print(f"    items={n_items} docs={len(p.get('docs') or [])}")
+            # print(json.dumps(crono, ensure_ascii=False, indent=2))
         items_total = sum(len(p.get("items") or []) for p in procesos)
         return _resumen(anio, vistas, duplicados, len(candidatos), 0, items_total,
                         t0, fallidos=fallidos, horas_radar=horas_radar)

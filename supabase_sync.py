@@ -382,9 +382,53 @@ def contar_convocatorias(fuente=None):
 # ---------------------------------------------------------------------------
 # PROD6 — Compras Menores (<= 8 UIT), API REST pública sin CAPTCHA
 # ---------------------------------------------------------------------------
+# Hard whitelist: columnas base + campos comerciales (cronograma denormalizado).
+# Cualquier llave fuera de esta tupla se descarta antes del upsert (PGRST204).
+COLUMNAS_CONVOCATORIAS_VALIDAS = (
+    "nomenclatura_norm",
+    "nomenclatura",
+    "entidad",
+    "fecha_publicacion",
+    "objeto",
+    "descripcion",
+    "monto",
+    "moneda",
+    "fuente",
+    "ocid",
+    "categoria",
+    "bloqueada",
+    "estado",
+    "id_contrato",
+    "fecha_fin_cotizacion",
+    "tipo_procedimiento",
+    "fecha_inicio_consultas",
+    "fecha_fin_consultas",
+    "fecha_inicio_cotizacion",
+    "fecha_integracion",
+    "fecha_presentacion",
+    "ficha_url",
+    "url_bases",
+    "file_code",
+    "updated_at",
+)
+
+
+def _sanitizar_convocatoria(convocatoria_dict):
+    """Hard whitelist: el payload solo conserva columnas válidas de convocatorias."""
+    if not convocatoria_dict:
+        return convocatoria_dict
+    return {
+        k: v
+        for k, v in convocatoria_dict.items()
+        if k in COLUMNAS_CONVOCATORIAS_VALIDAS
+    }
+
+
 # idEtapaContrato en uitContratoEtapaProjectionList (JS del buscador público).
 PROD6_ETAPA_CONSULTAS = 1
 PROD6_ETAPA_COTIZACION = 2
+PROD6_ETAPA_INTEGRACION = 3
+PROD6_ETAPA_PRESENTACION = 4
 PROD6_ARCHIVO_BASE = (
     "https://prod6.seace.gob.pe/v1/s8uit-services/archivo"
     "/archivos-publico/descargar-archivo-contrato"
@@ -394,6 +438,14 @@ PROD6_ARCHIVO_BASE = (
 def _etapa_por_id(etapas, id_etapa):
     for et in etapas or []:
         if int(et.get("idEtapaContrato") or 0) == id_etapa:
+            return et
+    return {}
+
+
+def _etapa_por_nombre(etapas, *needles):
+    for et in etapas or []:
+        nom = (et.get("nomEtapaContrato") or "").lower()
+        if any(n in nom for n in needles):
             return et
     return {}
 
@@ -416,6 +468,14 @@ def convocatoria_from_prod6(cab, resumen=None, etapas=None, docs=None):
     )
     consulta = _etapa_por_id(etapas, PROD6_ETAPA_CONSULTAS)
     cotiza = _etapa_por_id(etapas, PROD6_ETAPA_COTIZACION)
+    integra = (
+        _etapa_por_id(etapas, PROD6_ETAPA_INTEGRACION)
+        or _etapa_por_nombre(etapas, "integrac")
+    )
+    presenta = (
+        _etapa_por_id(etapas, PROD6_ETAPA_PRESENTACION)
+        or _etapa_por_nombre(etapas, "present")
+    )
     url_bases = ""
     file_code = None
     if docs:
@@ -438,18 +498,23 @@ def convocatoria_from_prod6(cab, resumen=None, etapas=None, docs=None):
         "monto": "" if monto is None else str(monto),
         "moneda": "PEN",
         "fuente": "PROD6",
+        "ocid": None,
+        "categoria": cab.get("nomObjetoContrato") or resumen.get("nomObjetoContrato") or "",
         "estado": cab.get("nomEstadoContrato") or resumen.get("nomEstadoContrato") or "",
         "id_contrato": None if id_contrato is None else str(id_contrato),
         "tipo_procedimiento": "Contratación menor (≤ 8 UIT)",
-        "categoria": cab.get("nomObjetoContrato") or resumen.get("nomObjetoContrato") or "",
         "fecha_inicio_consultas": _fecha_iso(consulta.get("fecIni")),
         "fecha_fin_consultas": _fecha_iso(consulta.get("fecFin")),
         "fecha_inicio_cotizacion": _fecha_iso(cotiza.get("fecIni")),
         "fecha_fin_cotizacion": _fecha_iso(
             cotiza.get("fecFin") or resumen.get("fecFinCotizacion")
         ),
-        # Ruta pública del buscador (SPA). /compras-menores/detalle/{id} es
-        # el microfrontend autenticado: sin sesión la página queda en blanco.
+        "fecha_integracion": _fecha_iso(
+            integra.get("fecFin") or integra.get("fecIni")
+        ),
+        "fecha_presentacion": _fecha_iso(
+            presenta.get("fecFin") or presenta.get("fecIni")
+        ),
         "ficha_url": (
             f"https://prod6.seace.gob.pe/buscador-publico/contrataciones/{id_contrato}"
             if id_contrato
@@ -457,11 +522,13 @@ def convocatoria_from_prod6(cab, resumen=None, etapas=None, docs=None):
         ),
         "url_bases": url_bases,
         "file_code": file_code,
+        "nid_convocatoria": None,
+        "nid_proceso": None,
         "updated_at": _now(),
     }
     if es_estado_terminal(row["estado"]):
         row["bloqueada"] = True
-    return row
+    return _sanitizar_convocatoria(row)
 
 
 def cronograma_from_prod6(nom_norm, etapas):
@@ -522,8 +589,38 @@ def items_from_prod6(nom_norm, items):
     return filas
 
 
+def _upsert_padres_convocatorias(convs):
+    """
+    Upsert de convocatorias con el mismo reintento 1x1 que upsert_rows,
+    devolviendo las nomenclatura_norm que sí quedaron en la tabla padre.
+    """
+    if not convs:
+        return set()
+    convs = [_sanitizar_convocatoria(c) for c in convs]
+    client = get_client()
+    landed = set()
+    for chunk in _chunks(convs):
+        try:
+            client.table("convocatorias").upsert(
+                chunk, on_conflict="nomenclatura_norm"
+            ).execute()
+            landed.update(c["nomenclatura_norm"] for c in chunk)
+        except Exception as e:
+            print(f"[!] Upsert lote convocatorias ({len(chunk)}): {e} → reintento 1x1")
+            for row in chunk:
+                try:
+                    client.table("convocatorias").upsert(
+                        row, on_conflict="nomenclatura_norm"
+                    ).execute()
+                    landed.add(row["nomenclatura_norm"])
+                except Exception as e2:
+                    print(f"[!] Fila convocatorias omitida: {e2}")
+    print(f"[+] Supabase convocatorias: {len(landed)}/{len(convs)} upserts")
+    return landed
+
+
 def upsert_prod6_proceso(cab, resumen=None, items=None, etapas=None, docs=None):
-    """Inserta una compra menor + ítems + cronograma + docs. Devuelve nomenclatura_norm."""
+    """Inserta una compra menor + ítems + docs. Devuelve nomenclatura_norm."""
     conv = convocatoria_from_prod6(cab, resumen, etapas=etapas, docs=docs)
     if not conv:
         return None
@@ -533,9 +630,10 @@ def upsert_prod6_proceso(cab, resumen=None, items=None, etapas=None, docs=None):
     filas = items_from_prod6(nom, items)
     if filas:
         upsert_rows("items_proceso", filas, "nomenclatura_norm,secuencia")
-    crono = cronograma_from_prod6(nom, etapas)
-    if crono:
-        upsert_rows("cronograma_proceso", crono, "nomenclatura_norm,id_etapa")
+    # cronograma_proceso no existe aún en este proyecto de Supabase.
+    # crono = cronograma_from_prod6(nom, etapas)
+    # if crono:
+    #     upsert_rows("cronograma_proceso", crono, "nomenclatura_norm,id_etapa")
     docs_rows = documentos_from_prod6(nom, docs)
     if docs_rows:
         upsert_rows("documentos_proceso", docs_rows, "file_id")
@@ -545,9 +643,11 @@ def upsert_prod6_proceso(cab, resumen=None, items=None, etapas=None, docs=None):
 def upsert_prod6_lote(procesos):
     """
     procesos: lista de dicts {cab, resumen, items, etapas, docs}.
-    Upsert en bloque: convocatorias primero por las FK.
+    Upsert en bloque: convocatorias primero (y con éxito) por las FK.
+    Ítems y documentos solo para nomenclaturas que sí persistieron en el padre.
+    cronograma_proceso se omite: la tabla no existe aún en este Supabase.
     """
-    convs, items, cronos, docs_all, vistos = [], [], [], [], set()
+    convs, items_por_nom, docs_por_nom, vistos = [], {}, {}, set()
     for p in procesos:
         conv = convocatoria_from_prod6(
             p.get("cab") or {},
@@ -560,14 +660,28 @@ def upsert_prod6_lote(procesos):
         vistos.add(conv["nomenclatura_norm"])
         nom = conv["nomenclatura_norm"]
         convs.append(conv)
-        items.extend(items_from_prod6(nom, p.get("items")))
-        cronos.extend(cronograma_from_prod6(nom, p.get("etapas")))
-        docs_all.extend(documentos_from_prod6(nom, p.get("docs")))
-    ok = upsert_rows("convocatorias", convs, "nomenclatura_norm")
+        items_por_nom[nom] = items_from_prod6(nom, p.get("items"))
+        docs_por_nom[nom] = documentos_from_prod6(nom, p.get("docs"))
+        # cronograma_proceso no existe aún — no se arma ni se upserta.
+        # cronos.extend(cronograma_from_prod6(nom, p.get("etapas")))
+
+    padres_ok = _upsert_padres_convocatorias(convs)
+    items = [
+        row for nom in padres_ok for row in items_por_nom.get(nom, [])
+    ]
+    docs_all = [
+        row for nom in padres_ok for row in docs_por_nom.get(nom, [])
+    ]
+    omitidas = vistos - padres_ok
+    if omitidas:
+        print(
+            f"[!] PROD6: {len(omitidas)} nomenclaturas sin fila en convocatorias; "
+            "se omiten items_proceso y documentos_proceso de esas llaves"
+        )
     if items:
         upsert_rows("items_proceso", items, "nomenclatura_norm,secuencia")
-    if cronos:
-        upsert_rows("cronograma_proceso", cronos, "nomenclatura_norm,id_etapa")
+    # if cronos:
+    #     upsert_rows("cronograma_proceso", cronos, "nomenclatura_norm,id_etapa")
     if docs_all:
         upsert_rows("documentos_proceso", docs_all, "file_id")
-    return ok, len(items)
+    return len(padres_ok), len(items)
