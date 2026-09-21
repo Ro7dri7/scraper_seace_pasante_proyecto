@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import subprocess
 import sys
 import time
@@ -139,45 +140,32 @@ def main():
     )
 
     if args.skip_seace:
-        print("[*] Delta SEACE omitido (--skip-seace).")
+        print("[*] Delta SEACE omitido (--skip-seace). El embudo completo es run_pipeline.sh / main.py.")
     else:
         state_path = ROOT / "handoff_state.json"
         monthly_handoff = ROOT / f"{base_prefix}_handoff.json"
         handoff_path = state_path if state_path.exists() else monthly_handoff
-        if not handoff_path.exists():
-            print(
-                f"[!] No hay handoff_state.json ni {monthly_handoff.name}; "
-                "no se lanza SEACE."
-            )
-        else:
-            handoff = json.loads(handoff_path.read_text(encoding="utf-8"))
-            fecha_max = (
-                handoff.get("fecha_max_seace")
-                or handoff.get("fecha_max_iso")
-                or handoff.get("fecha_max")
-            )
-            if not fecha_max:
-                print("[!] handoff sin fecha_max; no se lanza SEACE.")
-            else:
-                cmd = [
-                    py,
-                    "scraper_prod2.py",
-                    "--desde",
-                    str(fecha_max),
-                    "--year",
-                    year,
-                    "--objeto",
-                    "",
-                    "--nomenclaturas-file",
-                    str(handoff_path),
-                ]
-                if args.max_fichas_seace is not None:
-                    cmd.extend(["--max-fichas", str(args.max_fichas_seace)])
-                run_step(
-                    5,
-                    f"Delta SEACE PROD2 desde {fecha_max} hasta hoy (dedup + Supabase)",
-                    cmd,
-                )
+        horas = os.environ.get("EMBUDO_HORAS_RADAR") or "72"
+        run_step(
+            5,
+            f"Radar SEACE PROD6 ({horas}h, proxy, sin 2Captcha)",
+            [py, "scraper_prod6.py", "--anio", year, "--horas-radar", str(horas)],
+        )
+        cmd = [
+            py, "scraper_prod2.py",
+            "--year", year,
+            "--objeto", "",
+            "--horas-radar", str(horas),
+        ]
+        if handoff_path.exists():
+            cmd.extend(["--nomenclaturas-file", str(handoff_path)])
+        if args.max_fichas_seace is not None:
+            cmd.extend(["--max-fichas", str(args.max_fichas_seace)])
+        run_step(
+            6,
+            f"Francotirador SEACE PROD2 ({horas}h, proxy+2Captcha)",
+            cmd,
+        )
 
     print("*" * 75)
     print(f" ¡PIPELINE DE {year}-{month} COMPLETADO CON ÉXITO!")

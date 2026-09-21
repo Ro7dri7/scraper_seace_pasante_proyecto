@@ -22,6 +22,7 @@ from collections import defaultdict
 from pathlib import Path
 
 from lib_nomenclatura import extraer_nomenclatura
+from lib_embudo import clasificar_estado_oece
 
 # Desactivar verificación estricta de SSL si hay problemas con certificados gubernamentales
 SSL_CONTEXT = ssl.create_default_context()
@@ -232,13 +233,16 @@ def parse_oece_data(z, min_days_old=0, max_records=None, target_month=None):
     # 4. Procesar Licitaciones desde records.csv
     print("    -> Cruzando con licitaciones y entidades convocantes...")
     leads = []
+    stubs_bloqueados = []
     now = datetime.datetime.now()
     fecha_max = ""
     fecha_max_iso = ""
     fecha_min = ""
     nomenclaturas_norm = set()
     procesos_vistos = 0
+    procesos_bloqueados = 0
     fecha_max_dt = None
+    ocids_con_ganador = {ocid for ocid, _ruc in winners}
 
     with z.open("records.csv") as f:
         reader = csv.DictReader(io.TextIOWrapper(f, encoding='utf-8', errors='ignore'))
@@ -284,7 +288,33 @@ def parse_oece_data(z, min_days_old=0, max_records=None, target_month=None):
                 fecha_max_iso = pub_dt.isoformat()
 
             postulantes = tenderers_by_ocid.get(ocid, [])
+            status_raw = (
+                row.get("compiledRelease/tender/status")
+                or row.get("compiledRelease/tender/status/0")
+                or ""
+            )
+            estado_es, bloqueada = clasificar_estado_oece(
+                status_raw, tiene_ganador=(ocid in ocids_con_ganador)
+            )
+            if bloqueada:
+                procesos_bloqueados += 1
+
             if not postulantes:
+                # Igual persistimos la cabecera si el proceso ya cerró, para
+                # que PROD2/PROD6 jamás gasten proxy/captcha en él.
+                if bloqueada and nom_norm:
+                    stubs_bloqueados.append({
+                        "RUC": "",
+                        "Nomenclatura": nom_raw,
+                        "Nomenclatura Norma": nom_norm,
+                        "Fuente": "oece",
+                        "Licitación": titulo,
+                        "Entidad Convocante": row.get("compiledRelease/buyer/name", ""),
+                        "Fecha Convocatoria": pub_date_clean,
+                        "OCID": ocid,
+                        "Estado": estado_es,
+                        "Bloqueada": True,
+                    })
                 continue
 
             if min_days_old > 0 and days_old != "" and days_old is not None and days_old < min_days_old:
@@ -345,6 +375,8 @@ def parse_oece_data(z, min_days_old=0, max_records=None, target_month=None):
                     "Ver Proceso (Portal OECE)": f"https://contratacionesabiertas.oece.gob.pe/proceso/{ocid}",
                     "URL Bases (PDF Original)": url_bases,
                     "OCID": ocid,
+                    "Estado": estado_es,
+                    "Bloqueada": bloqueada,
                     "Requiere ISO": "Pendiente de Análisis IA"
                 }
                 leads.append(lead)
@@ -356,10 +388,13 @@ def parse_oece_data(z, min_days_old=0, max_records=None, target_month=None):
                 break
 
     # Ordenar estrictamente por Fecha Convocatoria descendente (las más actuales arriba)
+    leads.extend(stubs_bloqueados)
     leads.sort(key=lambda x: (str(x.get("Fecha Convocatoria") or ""), str(x.get("Licitación") or "")), reverse=True)
 
-    print(f"[+] Cruce completado. Total de leads (postulantes) extraídos: {len(leads)}")
+    print(f"[+] Cruce completado. Total de leads (postulantes) extraídos: {len(leads) - len(stubs_bloqueados)}")
     print(f"[+] Procesos OECE indexados (con o sin postulantes): {procesos_vistos}")
+    print(f"[+] Procesos marcados bloqueada (Finalizada/Otorgada/Cancelada): {procesos_bloqueados}")
+    print(f"[+] Cabeceras bloqueadas sin postulantes (stubs): {len(stubs_bloqueados)}")
     print(f"[+] fecha_max OECE (posta SEACE): {fecha_max or 'N/D'}")
     if leads:
         max_date = leads[0].get("Fecha Convocatoria")
@@ -371,7 +406,8 @@ def parse_oece_data(z, min_days_old=0, max_records=None, target_month=None):
         "fecha_min": fecha_min,
         "nomenclaturas_norm": sorted(nomenclaturas_norm),
         "total_procesos": procesos_vistos,
-        "total_leads": len(leads),
+        "total_leads": len(leads) - len(stubs_bloqueados),
+        "total_bloqueados": procesos_bloqueados,
     }
     return leads, meta
 
@@ -552,6 +588,7 @@ def main():
     try:
         from supabase_sync import upsert_oece_leads
         print("[*] Subiendo OECE a Supabase (convocatorias + proveedores)...")
+        print("[*] Antes del upsert se enriquece cada RUC con RNP + SUNAT (caché en disco).")
         upsert_oece_leads(leads)
     except Exception as e:
         print(f"[!] Supabase OECE: {e}")

@@ -18,14 +18,17 @@ import sys
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
-from datetime import date, datetime, timezone
+from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 
 import requests
 
+from lib_embudo import guardar_radar, horas_radar_default
 from lib_nomenclatura import normalizar_nomenclatura
+from proxy_iproyal import aplicar_proxy, log_proxy_status
 from supabase_sync import (
     load_env,
+    nomenclaturas_bloqueadas,
     nomenclaturas_en_nube,
     upsert_prod6_lote,
 )
@@ -54,6 +57,13 @@ BASE = (
 ).rstrip("/")
 URL_BUSCADOR = f"{BASE}/buscador"
 URL_DETALLE = f"{BASE}/listar-completo"
+# Microservicio público de archivos (no el de contrataciones).
+# CATEGORIA_1 = requerimiento / bases, según MAESTRA_TIPO_ARCHIVO del front.
+URL_ARCHIVOS = (
+    _env("PROD6_ARCHIVOS_BASE")
+    or "https://prod6.seace.gob.pe/v1/s8uit-services/archivo/archivos-publico"
+).rstrip("/")
+COD_CATEGORIA_REQUERIMIENTO = 1
 
 ANIO = _env("PROD6_ANIO") or str(date.today().year)
 ESTADO = _env("PROD6_ESTADO") or "2"        # 2 = Vigente
@@ -67,11 +77,13 @@ TIMEOUT = _env_int("PROD6_TIMEOUT", 60)
 REINTENTOS = _env_int("PROD6_REINTENTOS", 3)
 # Páginas consecutivas sin nomenclaturas nuevas antes de cortar el delta.
 PAGINAS_SIN_NUEVOS = _env_int("PROD6_PAGINAS_SIN_NUEVOS", 3)
-LOTE_UPSERT = _env_int("PROD6_LOTE_UPSERT", 50)
+HORAS_RADAR = _env_int("EMBUDO_HORAS_RADAR", horas_radar_default())
 RESUMEN_FILE = Path(__file__).with_name("prod6_delta_resumen.json")
+_PROXY_LOG_HECHO = False
 
 
 def nueva_sesion():
+    global _PROXY_LOG_HECHO
     s = requests.Session()
     s.headers.update({
         "User-Agent": (
@@ -82,6 +94,9 @@ def nueva_sesion():
         "Accept-Language": "es-ES,es;q=0.9",
         "Referer": "https://prod6.seace.gob.pe/",
     })
+    if aplicar_proxy(s) and not _PROXY_LOG_HECHO:
+        log_proxy_status("[+] PROD6")
+        _PROXY_LOG_HECHO = True
     return s
 
 
@@ -91,6 +106,11 @@ def get_json(session, url, params=None):
     for intento in range(1, REINTENTOS + 1):
         try:
             r = session.get(url, params=params, timeout=TIMEOUT)
+            if r.status_code == 403:
+                raise RuntimeError(
+                    f"WAF 403 en PROD6 ({url}). Revisa IPRoyal (Country PE) "
+                    "o PROXY_USER/PROXY_PASS."
+                )
             r.raise_for_status()
             return r.json()
         except Exception as e:
@@ -119,6 +139,18 @@ def buscar_pagina(session, page, anio=None, page_size=None):
     return filas, int(total)
 
 
+def parse_fec_publica(valor):
+    if not valor:
+        return None
+    s = str(valor).strip()
+    for fmt, cut in (("%d/%m/%Y %H:%M:%S", 19), ("%d/%m/%Y %H:%M", 16), ("%d/%m/%Y", 10)):
+        try:
+            return datetime.strptime(s[:cut], fmt)
+        except ValueError:
+            continue
+    return None
+
+
 def nomenclatura_de(fila):
     """nroDescripcion es la llave; en el buscador viene como desContratacion."""
     raw = (fila.get("nroDescripcion") or fila.get("desContratacion") or "").strip()
@@ -129,43 +161,85 @@ def nomenclatura_de(fila):
 # Paso C — Detalle
 # ---------------------------------------------------------------------------
 def obtener_detalle(session, id_contrato):
+    """
+    GET listar-completo. Devuelve (cab, items, etapas).
+    Las etapas viven en uitContratoEtapaProjectionList (no hay que scrapear el DOM).
+    """
     data = get_json(session, URL_DETALLE, params={"id_contrato": id_contrato})
     if not data:
-        return None, []
+        return None, [], []
     if isinstance(data, list):
         data = data[0] if data else {}
     cab = data.get("uitContratoCompletoProjection") or {}
     items = data.get("uitContratoItemProjectionList") or []
+    etapas = data.get("uitContratoEtapaProjectionList") or []
     if not cab:
-        return None, []
-    return cab, items
+        return None, [], []
+    return cab, items, etapas
+
+
+def listar_archivos_requerimiento(session, id_contrato):
+    """
+    GET /archivos-publico/listar-archivos-contrato/{id}/{codCategoria=1}
+    No descarga el ZIP: solo arma la URL pública de descarga (on-demand).
+    """
+    url = f"{URL_ARCHIVOS}/listar-archivos-contrato/{id_contrato}/{COD_CATEGORIA_REQUERIMIENTO}"
+    data = get_json(session, url)
+    if not data:
+        return []
+    if isinstance(data, dict):
+        data = data.get("data") or data.get("archivos") or []
+    docs = []
+    for row in data or []:
+        file_id = row.get("idContratoArchivo")
+        if not file_id:
+            continue
+        nombre = (
+            row.get("nombre")
+            or row.get("nombreArchivo")
+            or row.get("docSolicitado")
+            or f"requerimiento_{id_contrato}.zip"
+        )
+        docs.append({
+            "file_id": f"prod6-{file_id}",
+            "file_code": str(file_id),
+            "categoria": "requerimiento",
+            "documento": row.get("descripcion") or "Requerimiento / Bases",
+            "nombre_archivo": nombre,
+            "url_descarga": f"{URL_ARCHIVOS}/descargar-archivo-contrato/{file_id}",
+        })
+    return docs
 
 
 # ---------------------------------------------------------------------------
 # Orquestación del módulo
 # ---------------------------------------------------------------------------
 def ejecutar(anio=None, max_paginas=None, max_detalles=None, full=False,
-             conocidas=None, dry_run=False):
+             conocidas=None, dry_run=False, horas_radar=None):
     """
-    Recorre el buscador, filtra lo ya cargado y sube solo los procesos nuevos.
-    Con dry_run=True hace todo salvo escribir en Supabase.
-    Devuelve el resumen de la corrida.
+    Radar 48–72h: solo procesos vigentes recientes. Omite nomenclaturas
+    ya en Supabase o marcadas bloqueada por OECE (no gasta proxy en detalle).
     """
     anio = anio or ANIO
     max_paginas = MAX_PAGES if max_paginas is None else max_paginas
     max_detalles = MAX_DETALLES if max_detalles is None else max_detalles
+    horas_radar = HORAS_RADAR if horas_radar is None else horas_radar
+    corte = datetime.now() - timedelta(hours=horas_radar)
     t0 = time.time()
 
     print("=" * 75)
-    print(f" SEACE PROD6 — Compras Menores <= 8 UIT | año={anio} estado={ESTADO}")
+    print(f" SEACE PROD6 — RADAR {horas_radar}h | año={anio} estado={ESTADO}")
     print("=" * 75, flush=True)
 
+    bloqueadas = set()
     if conocidas is None:
         try:
             conocidas = nomenclaturas_en_nube()
-            print(f"[+] Nomenclaturas ya en Supabase: {len(conocidas)}")
+            bloqueadas = nomenclaturas_bloqueadas()
+            conocidas |= bloqueadas
+            print(f"[+] Nomenclaturas ya en Supabase: {len(conocidas) - len(bloqueadas)}")
+            print(f"[+] Bloqueadas por OECE (se omiten): {len(bloqueadas)}")
         except Exception as e:
-            # Sin dedup escribiríamos el catálogo entero en cada corrida.
             if not dry_run:
                 raise SystemExit(
                     f"[-] No se pudo leer Supabase para deduplicar: {e}"
@@ -194,23 +268,35 @@ def ejecutar(anio=None, max_paginas=None, max_detalles=None, full=False,
 
         vistas += len(filas)
         nuevos_pagina = 0
+        dentro_ventana = 0
         for fila in filas:
+            pub = parse_fec_publica(fila.get("fecPublica"))
+            if pub is None:
+                if not full:
+                    continue
+            elif pub >= corte:
+                dentro_ventana += 1
+            elif not full:
+                continue
             raw, norm = nomenclatura_de(fila)
             id_contrato = fila.get("idContrato")
             if not norm or not id_contrato:
                 continue
-            if norm in conocidas or norm in vistos_run:
+            if norm in conocidas or norm in vistos_run or norm in bloqueadas:
                 duplicados += 1
                 continue
             vistos_run.add(norm)
             candidatos.append({"id_contrato": id_contrato, "nomenclatura": raw,
-                               "resumen": fila})
+                               "nomenclatura_norm": norm, "resumen": fila})
             nuevos_pagina += 1
 
-        print(f"[+] pág.{page}: {len(filas)} filas | nuevas={nuevos_pagina} "
-              f"| acumulado nuevas={len(candidatos)}")
+        print(f"[+] pág.{page}: {len(filas)} filas | en_ventana={dentro_ventana} "
+              f"| nuevas={nuevos_pagina} | acumulado={len(candidatos)}")
 
         paginas_secas = paginas_secas + 1 if nuevos_pagina == 0 else 0
+        if not full and dentro_ventana == 0 and filas:
+            print(f"[*] Página {page} ya está fuera de las {horas_radar}h — corte de radar")
+            break
         if not full and paginas_secas >= PAGINAS_SIN_NUEVOS:
             print(f"[*] {paginas_secas} páginas seguidas sin novedades — "
                   "corte de delta (usa --full para barrer todo)")
@@ -228,9 +314,14 @@ def ejecutar(anio=None, max_paginas=None, max_detalles=None, full=False,
         page += 1
         time.sleep(SLEEP_SEC)
 
+    try:
+        guardar_radar(candidatos, horas_radar, extra={"vistas": vistas, "duplicados": duplicados})
+    except OSError as e:
+        print(f"[!] No se pudo escribir radar_nuevas.json: {e}")
+
     if not candidatos:
         print("[=] Sin procesos nuevos en PROD6.")
-        return _resumen(anio, vistas, duplicados, 0, 0, 0, t0)
+        return _resumen(anio, vistas, duplicados, 0, 0, 0, t0, horas_radar=horas_radar)
 
     # Paso C: detalle de cada proceso nuevo (en paralelo, con cortesía)
     print(f"[*] Descargando detalle de {len(candidatos)} procesos nuevos...")
@@ -240,11 +331,18 @@ def ejecutar(anio=None, max_paginas=None, max_detalles=None, full=False,
     def _detalle(c):
         if not getattr(local, "session", None):
             local.session = nueva_sesion()
-        cab, items = obtener_detalle(local.session, c["id_contrato"])
+        cab, items, etapas = obtener_detalle(local.session, c["id_contrato"])
+        docs = listar_archivos_requerimiento(local.session, c["id_contrato"]) if cab else []
         time.sleep(SLEEP_SEC)
         if not cab:
             return None
-        return {"cab": cab, "resumen": c["resumen"], "items": items}
+        return {
+            "cab": cab,
+            "resumen": c["resumen"],
+            "items": items,
+            "etapas": etapas,
+            "docs": docs,
+        }
 
     procesos = []
     fallidos = 0
@@ -261,17 +359,25 @@ def ejecutar(anio=None, max_paginas=None, max_detalles=None, full=False,
     insertados = 0
     items_total = 0
     if dry_run:
-        from supabase_sync import convocatoria_from_prod6, items_from_prod6
+        from supabase_sync import (
+            convocatoria_from_prod6,
+            cronograma_from_prod6,
+            items_from_prod6,
+        )
 
         print("[*] DRY-RUN: no se escribe en Supabase. Muestra del mapeo:")
         for p in procesos[:3]:
-            conv = convocatoria_from_prod6(p["cab"], p["resumen"])
+            conv = convocatoria_from_prod6(
+                p["cab"], p["resumen"], etapas=p.get("etapas"), docs=p.get("docs")
+            )
             n_items = len(items_from_prod6(conv["nomenclatura_norm"], p["items"]))
+            crono = cronograma_from_prod6(conv["nomenclatura_norm"], p.get("etapas"))
             print(json.dumps(conv, ensure_ascii=False, indent=2))
-            print(f"    items mapeados: {n_items}")
+            print(f"    items={n_items} etapas={len(crono)} docs={len(p.get('docs') or [])}")
+            print(json.dumps(crono, ensure_ascii=False, indent=2))
         items_total = sum(len(p.get("items") or []) for p in procesos)
         return _resumen(anio, vistas, duplicados, len(candidatos), 0, items_total,
-                        t0, fallidos=fallidos)
+                        t0, fallidos=fallidos, horas_radar=horas_radar)
 
     for i in range(0, len(procesos), LOTE_UPSERT):
         lote = procesos[i : i + LOTE_UPSERT]
@@ -284,17 +390,19 @@ def ejecutar(anio=None, max_paginas=None, max_detalles=None, full=False,
         items_total += n_items
 
     resumen = _resumen(anio, vistas, duplicados, len(candidatos), insertados,
-                       items_total, t0, fallidos=fallidos)
+                       items_total, t0, fallidos=fallidos, horas_radar=horas_radar)
     print("---")
     print(f"[+] PROD6 | vistas={vistas} duplicados={duplicados} "
           f"nuevas={len(candidatos)} inyectadas={insertados} items={items_total}")
     return resumen
 
 
-def _resumen(anio, vistas, duplicados, nuevas, insertados, items, t0, fallidos=0):
+def _resumen(anio, vistas, duplicados, nuevas, insertados, items, t0, fallidos=0,
+             horas_radar=None):
     data = {
         "fuente": "PROD6",
         "anio": str(anio),
+        "horas_radar": horas_radar if horas_radar is not None else HORAS_RADAR,
         "vistas": vistas,
         "duplicados": duplicados,
         "nuevas": nuevas,
@@ -330,6 +438,12 @@ def parse_args():
         action="store_true",
         help="Extrae y mapea, pero no escribe en Supabase",
     )
+    p.add_argument(
+        "--horas-radar",
+        type=int,
+        default=HORAS_RADAR,
+        help="Solo procesos publicados en las últimas N horas (default 72)",
+    )
     return p.parse_args()
 
 
@@ -341,5 +455,6 @@ if __name__ == "__main__":
         max_detalles=args.max_detalles,
         full=args.full,
         dry_run=args.dry_run,
+        horas_radar=args.horas_radar,
     )
     sys.exit(0 if resultado is not None else 1)

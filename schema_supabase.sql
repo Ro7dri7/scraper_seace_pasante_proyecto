@@ -117,9 +117,64 @@ create table if not exists public.proveedores (
   primary key (ruc, nomenclatura_norm)
 );
 
+-- PROD6: la ficha pública vive en el buscador, no en /compras-menores/detalle.
+update public.convocatorias
+set ficha_url = 'https://prod6.seace.gob.pe/buscador-publico/contrataciones/' || id_contrato
+where fuente = 'PROD6'
+  and id_contrato is not null
+  and id_contrato <> ''
+  and (
+    ficha_url is null
+    or ficha_url like '%/compras-menores/detalle/%'
+  );
+
+-- OECE: tipo de procedimiento + categoría (vienen del CSV UES).
+alter table public.convocatorias add column if not exists tipo_procedimiento text;
+alter table public.convocatorias add column if not exists categoria text;
+alter table public.convocatorias add column if not exists fecha_inicio_consultas timestamptz;
+alter table public.convocatorias add column if not exists fecha_fin_consultas timestamptz;
+alter table public.convocatorias add column if not exists fecha_inicio_cotizacion timestamptz;
+
+create table if not exists public.cronograma_proceso (
+  nomenclatura_norm text not null references public.convocatorias(nomenclatura_norm) on delete cascade,
+  id_etapa int not null,
+  nombre_etapa text,
+  fecha_inicio timestamptz,
+  fecha_fin timestamptz,
+  updated_at timestamptz default now(),
+  primary key (nomenclatura_norm, id_etapa)
+);
+
+alter table public.proveedores add column if not exists departamento text;
+alter table public.proveedores add column if not exists provincia text;
+alter table public.proveedores add column if not exists distrito text;
+alter table public.proveedores add column if not exists estado_sunat text;
+alter table public.proveedores add column if not exists condicion_domicilio text;
+alter table public.proveedores add column if not exists habilitado_rnp text;
+alter table public.proveedores add column if not exists apto_contratar text;
+alter table public.proveedores add column if not exists ficha_rnp_url text;
+alter table public.proveedores add column if not exists telefono_rnp text;
+alter table public.proveedores add column if not exists email_rnp text;
+
+create or replace view public.convocatorias_con_antiguedad as
+select
+  c.*,
+  greatest(
+    0,
+    (current_date - (c.fecha_publicacion at time zone 'America/Lima')::date)
+  )::integer as dias_transcurridos
+from public.convocatorias c;
+
 create index if not exists idx_conv_fecha on public.convocatorias (fecha_publicacion desc);
 create index if not exists idx_conv_fuente on public.convocatorias (fuente);
 create index if not exists idx_conv_requiere_iso on public.convocatorias (requiere_iso);
+
+-- Embudo de ahorro: procesos terminales no se vuelven a consultar en SEACE.
+alter table public.convocatorias
+  add column if not exists bloqueada boolean default false;
+create index if not exists idx_conv_bloqueada
+  on public.convocatorias (bloqueada)
+  where bloqueada is true;
 create index if not exists idx_prov_ruc on public.proveedores (ruc);
 create index if not exists idx_items_cubso on public.items_proceso (codigo_cubso);
 

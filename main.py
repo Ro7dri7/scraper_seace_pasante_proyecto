@@ -1,17 +1,10 @@
 """
-LicitApp — flujo maestro de las 3 fuentes.
+LicitApp — flujo maestro de las 3 fuentes (embudo de ahorro).
 
-Orden de ejecución:
-  1) OECE            — bulk histórico (paquete mensual + enriquecimiento).
-  2) SEACE PROD2     — delta de Licitaciones Mayores (by-pass 2Captcha).
-  3) SEACE PROD6     — delta de Compras Menores (<= 8 UIT, API REST).
-
-Cada etapa reporta cuántos procesos nuevos inyectó en Supabase. El conteo se
-mide contra la tabla `convocatorias` (snapshot antes/después), así que refleja
-filas realmente creadas, no filas vistas.
-
-Ninguna etapa descarga PDFs ni ZIPs: solo se persisten metadatos y la URL
-dinámica de descarga (estrategia on-demand).
+Orden:
+  1) OECE            — bulk OCDS, SIN proxy. Marca bloqueada si está cerrada.
+  2) SEACE PROD6     — radar 48–72h, proxy IPRoyal, sin 2Captcha.
+  3) SEACE PROD2     — radar 48–72h, IPRoyal + 2Captcha; ficha solo de nuevas no bloqueadas.
 """
 from __future__ import annotations
 
@@ -106,32 +99,37 @@ def etapa_oece(py, args):
             "--workers-sunat", str(args.workers_sunat),
             "--skip-seace",
         ]
-    correr(f"FUENTE 1/3 · OECE (bulk histórico {args.year}-{args.month})", cmd)
+    correr(f"FUENTE 1/3 · OECE (bulk, sin proxy) {args.year}-{args.month}", cmd, obligatorio=True)
 
 
 def etapa_prod2(py, args, base_prefix):
-    """Delta de Licitaciones Mayores. Arranca en la fecha_max de OECE."""
-    fecha_max, handoff_path = fecha_max_handoff(base_prefix)
-    if not fecha_max:
-        print("[!] Sin handoff OECE con fecha_max — PROD2 usará su ventana por defecto.")
-    cmd = [py, "scraper_prod2.py", "--year", args.year, "--objeto", ""]
-    if fecha_max:
-        cmd += ["--desde", str(fecha_max)]
+    """Francotirador: radar 48–72h, ficha 2Captcha solo de nomenclaturas nuevas no bloqueadas."""
+    _, handoff_path = fecha_max_handoff(base_prefix)
+    cmd = [
+        py, "scraper_prod2.py",
+        "--year", args.year,
+        "--objeto", "",
+        "--horas-radar", str(args.horas_radar),
+    ]
     if handoff_path:
         cmd += ["--nomenclaturas-file", str(handoff_path)]
     if args.max_fichas_prod2 is not None:
         cmd += ["--max-fichas", str(args.max_fichas_prod2)]
-    correr("FUENTE 2/3 · SEACE PROD2 (delta mayor, 2Captcha)", cmd)
+    correr("FUENTE 3/3 · SEACE PROD2 (radar + 2Captcha)", cmd)
 
 
 def etapa_prod6(py, args):
-    """Delta de Compras Menores vía API REST (sin CAPTCHA)."""
-    cmd = [py, "scraper_prod6.py", "--anio", args.year]
+    """Radar: últimas 48–72h, proxy IPRoyal, sin CAPTCHA. Omite bloqueadas."""
+    cmd = [
+        py, "scraper_prod6.py",
+        "--anio", args.year,
+        "--horas-radar", str(args.horas_radar),
+    ]
     if args.max_detalles_prod6 is not None:
         cmd += ["--max-detalles", str(args.max_detalles_prod6)]
     if args.prod6_full:
         cmd += ["--full"]
-    correr("FUENTE 3/3 · SEACE PROD6 (delta menor, API REST)", cmd)
+    correr("FUENTE 2/3 · SEACE PROD6 (radar 48–72h, proxy)", cmd)
 
 
 # ---------------------------------------------------------------------------
@@ -159,6 +157,12 @@ def parse_args():
         action="store_true",
         help="PROD6 barre todas las páginas aunque no haya nomenclaturas nuevas",
     )
+    p.add_argument(
+        "--horas-radar",
+        type=int,
+        default=72,
+        help="Ventana de publicación PROD6/PROD2 en horas (48–72)",
+    )
     args = p.parse_args()
     args.year = str(args.year).strip()
     args.month = f"{int(args.month):02d}"
@@ -173,7 +177,7 @@ def main():
 
     print("*" * 75)
     print(f" LICITAPP — MOTOR UNIFICADO | PERIODO {args.year}-{args.month}")
-    print(" Estrategia on-demand: se guardan URLs de descarga, no archivos.")
+    print(" Embudo: OECE (gratis) → PROD6 (proxy) → PROD2 (proxy+2Captcha).")
     print("*" * 75, flush=True)
 
     base = contar_convocatorias()
@@ -183,9 +187,9 @@ def main():
 
     etapas = [
         ("OECE (bulk histórico)", args.skip_oece, lambda: etapa_oece(py, args)),
-        ("SEACE PROD2 (delta mayor)", args.skip_prod2,
+        ("SEACE PROD6 (radar menor)", args.skip_prod6, lambda: etapa_prod6(py, args)),
+        ("SEACE PROD2 (radar mayor)", args.skip_prod2,
          lambda: etapa_prod2(py, args, base_prefix)),
-        ("SEACE PROD6 (delta menor)", args.skip_prod6, lambda: etapa_prod6(py, args)),
     ]
 
     previo = base

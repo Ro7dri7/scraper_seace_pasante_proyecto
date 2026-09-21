@@ -83,7 +83,22 @@ def extraer_action_v3(html, default="frmBuscadorProcedimientosSeleccion"):
     return m.group(1) if m else default
 
 
-def resolver_recaptcha(sitekey, page_url, key=None, version="v3", action=None, min_score=0.3):
+def resolver_recaptcha(
+    sitekey,
+    page_url,
+    key=None,
+    version="v3",
+    action=None,
+    min_score=0.3,
+    proxy=None,
+    proxytype="HTTP",
+):
+    """
+    Envía el recaptcha a 2Captcha y hace polling hasta el token.
+
+    Si se pasa proxy (user:pass@host:port), 2Captcha resuelve saliendo por
+    esa IP residencial: el token queda atado al mismo origen que el POST SEACE.
+    """
     key = key or api_key()
     action = action or os.environ.get("SEACE_RECAPTCHA_ACTION") or "frmBuscadorProcedimientosSeleccion"
     version = (version or os.environ.get("SEACE_RECAPTCHA_VERSION") or "v3").lower()
@@ -99,6 +114,10 @@ def resolver_recaptcha(sitekey, page_url, key=None, version="v3", action=None, m
         data["version"] = "v3"
         data["action"] = action
         data["min_score"] = str(min_score)
+    if proxy:
+        data["proxy"] = proxy
+        data["proxytype"] = (proxytype or "HTTP").upper()
+        print("[*] 2Captcha: resolverá el token a través del proxy residencial")
     r = requests.post(
         IN_URL,
         data=data,

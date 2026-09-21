@@ -3,7 +3,7 @@ SEACE PROD2 (Licitaciones Mayores) — listado HTTP (PrimeFaces AJAX) + SQLite.
 
 Modos:
   backfill → ventana fija (FECHA_INICIO/FIN), barra todas las páginas.
-  sync     → ventana corta desde fecha_max OECE / DB hasta hoy (delta).
+  sync     → ventana radar 48–72h. Ficha 2Captcha solo de nomenclaturas nuevas no bloqueadas.
 
 reCAPTCHA: 2Captcha (TWOCAPTCHA_API_KEY). Las fichas se abren en la
 misma página del listado, antes de paginar, para no invalidar el ViewState.
@@ -36,7 +36,9 @@ from captcha_2captcha import (
     extraer_sitekey,
     resolver_recaptcha,
 )
+from lib_embudo import horas_radar_default
 from lib_nomenclatura import normalizar_nomenclatura
+from proxy_iproyal import aplicar_proxy, log_proxy_status, proxy_para_2captcha
 from supabase_sync import construir_url_alfresco
 
 warnings.filterwarnings("ignore", category=XMLParsedAsHTMLWarning)
@@ -88,6 +90,7 @@ _OBJETO_RAW = _env("SEACE_OBJETO", "")
 OBJETO = _OBJETO_RAW or None
 
 DIAS_LOOKBACK = _env_int("SEACE_DIAS_LOOKBACK", 3)
+HORAS_RADAR = _env_int("EMBUDO_HORAS_RADAR", horas_radar_default())
 DIAS_SOLAPE = _env_int("SEACE_DIAS_SOLAPE", 1)
 
 ROWS = _env_int("SEACE_ROWS", 20)
@@ -127,6 +130,8 @@ class Seace:
             "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
             "Accept-Language": "es-ES,es;q=0.9",
         })
+        if aplicar_proxy(self.s):
+            log_proxy_status("[+] PROD2")
         self._vs = None
         self.filtros = {}
         self.sitekey = None
@@ -134,6 +139,11 @@ class Seace:
 
     def refresh(self):
         r = self.s.get(self.page, timeout=60)
+        if r.status_code == 403:
+            raise RuntimeError(
+                "WAF 403 en PROD2. El proxy IPRoyal no está activo, "
+                "está mal autenticado o la IP residencial fue marcada."
+            )
         r.raise_for_status()
         self.soup = BeautifulSoup(r.text, "lxml")
         vs = self.soup.find("input", {"name": "javax.faces.ViewState"})
@@ -234,6 +244,8 @@ class Seace:
             f"{FORM}:dfechaFin_input": fecha_fin,
             f"{FORM}:tokenBusProSel": token,
             f"{FORM}:ipClienteIpify": IP_CLIENTE,
+            "g-recaptcha-response": token,
+            "g-recaptcha-response-v3": token,
             **expand,
         }
         if ver_name:
@@ -360,10 +372,12 @@ def detectar_ip_publica():
         print(f"[+] IP pública (SEACE_IP_CLIENTE): {IP_CLIENTE}")
         return IP_CLIENTE
     try:
-        ip = requests.get("https://api.ipify.org", timeout=10).text.strip()
+        s = requests.Session()
+        aplicar_proxy(s)
+        ip = s.get("https://api.ipify.org", timeout=15).text.strip()
         if ip:
             IP_CLIENTE = ip
-            print(f"[+] IP pública: {IP_CLIENTE}")
+            print(f"[+] IP pública (vía proxy si está activo): {IP_CLIENTE}")
     except Exception as e:
         print(f"[!] No se pudo detectar IP pública ({e}); se usa {IP_CLIENTE or 'vacío'}")
     return IP_CLIENTE
@@ -371,17 +385,15 @@ def detectar_ip_publica():
 
 def obtener_token_recaptcha(seace):
     html = getattr(seace, "page_html", "") or ""
-    sitekey = (
-        _env("SEACE_RECAPTCHA_SITEKEY")
-        or seace.sitekey
-        or extraer_sitekey(html)
-    )
+    sitekey = extraer_sitekey(html) or seace.sitekey or _env("SEACE_RECAPTCHA_SITEKEY")
     if not sitekey:
         raise SystemExit(
-            "[-] No se encontró sitekey de reCAPTCHA v3. "
+            "[-] No se encontró sitekey de reCAPTCHA en el HTML. "
             "Revisa SEACE_RECAPTCHA_SITEKEY en .env"
         )
+    print(f"[+] Sitekey extraído del HTML: {sitekey[:16]}...")
     action = _env("SEACE_RECAPTCHA_ACTION") or extraer_action_v3(html)
+    proxy, proxytype = proxy_para_2captcha()
     try:
         token = resolver_recaptcha(
             sitekey,
@@ -389,6 +401,8 @@ def obtener_token_recaptcha(seace):
             version=_env("SEACE_RECAPTCHA_VERSION", "v3"),
             action=action,
             min_score=float(_env("SEACE_RECAPTCHA_MIN_SCORE", "0.3") or 0.3),
+            proxy=proxy,
+            proxytype=proxytype or "HTTP",
         )
     except CaptchaZeroBalance as e:
         raise SystemExit(f"[-] {e}") from e
@@ -424,10 +438,12 @@ def cargar_nomenclaturas_oece(path):
                 known.add(n)
     print(f"[+] Nomenclaturas OECE cargadas para deduplicar: {len(known)}")
     try:
-        from supabase_sync import nomenclaturas_en_nube
+        from supabase_sync import nomenclaturas_bloqueadas, nomenclaturas_en_nube
         cloud = nomenclaturas_en_nube()
-        known |= cloud
+        bloqueadas = nomenclaturas_bloqueadas()
+        known |= cloud | bloqueadas
         print(f"[+] Nomenclaturas en Supabase: {len(cloud)} (unión={len(known)})")
+        print(f"[+] Bloqueadas por OECE (se omiten fichas): {len(bloqueadas)}")
     except Exception as e:
         print(f"[!] No se pudieron leer nomenclaturas de Supabase: {e}")
     return known
@@ -719,6 +735,7 @@ def db_connect():
         ("fuente", "TEXT"),
         ("url_bases", "TEXT"),
         ("file_code", "TEXT"),
+        ("bloqueada", "INTEGER DEFAULT 0"),
     ):
         if col not in cols:
             conn.execute(f"ALTER TABLE licitaciones ADD COLUMN {col} {typ}")
@@ -849,14 +866,10 @@ def resolver_ventana(conn):
         print(f"[*] MODO=backfill ventana fija {FECHA_INICIO}..{FECHA_FIN}")
         return FECHA_INICIO, FECHA_FIN
 
-    # sync
-    mx = db_max_fecha(conn)
-    if mx is None:
-        ini = hoy - timedelta(days=DIAS_LOOKBACK)
-        print(f"[*] MODO=sync DB vacía → lookback {DIAS_LOOKBACK}d: {ini}..{hoy}")
-    else:
-        ini = mx - timedelta(days=DIAS_SOLAPE)
-        print(f"[*] MODO=sync desde DB max={mx} −{DIAS_SOLAPE}d → {ini}..{hoy}")
+    # sync: ventana corta del radar (48–72h). No se usa la fecha_max histórica de OECE.
+    horas = HORAS_RADAR if HORAS_RADAR >= 24 else 72
+    ini = (datetime.now() - timedelta(hours=horas)).date()
+    print(f"[*] MODO=sync radar {horas}h → {ini}..{hoy}")
     return ini.strftime("%d/%m/%Y"), hoy.strftime("%d/%m/%Y")
 
 
@@ -944,10 +957,12 @@ def barrer_listado(seace, conn, token, fecha_ini, fecha_fin, known_oece=None,
                     fila["fuente"] = "ambos"
                     if nid:
                         conn.execute(
-                            "UPDATE licitaciones SET fuente=? WHERE nid_convocatoria=?",
+                            "UPDATE licitaciones SET fuente=?, bloqueada=1 WHERE nid_convocatoria=?",
                             ("ambos", nid),
                         )
-                    print(f"  [=] Duplicado OECE/Supabase (omitir ficha): {fila.get('nomenclatura')}")
+                    print(f"  [=] Duplicado/bloqueada (omitir ficha): {fila.get('nomenclatura')}")
+                    continue
+                if nid not in nuevas_nids:
                     continue
                 fila["fuente"] = "seace"
                 try:
@@ -957,13 +972,6 @@ def barrer_listado(seace, conn, token, fecha_ini, fecha_fin, known_oece=None,
                     print(f"  [!] Supabase listado: {e}")
                 if not nid or nid in fichas_hechas:
                     continue
-                if nid not in nuevas_nids:
-                    ya = conn.execute(
-                        "SELECT docs_bases_ok FROM licitaciones WHERE nid_convocatoria=?",
-                        (nid,),
-                    ).fetchone()
-                    if ya and ya[0]:
-                        continue
                 if max_fichas is not None and fichas_ok >= max_fichas:
                     break
                 try:
@@ -1148,14 +1156,22 @@ def procesar_ficha_y_docs(seace, fila, conn=None):
 # main
 # ---------------------------------------------------------------------------
 def parse_args():
-    p = argparse.ArgumentParser(description="Delta SEACE (JSF) desde fecha_max OECE hasta hoy")
-    p.add_argument("--desde", help="Fecha inicio DD/MM/YYYY o YYYY-MM-DD (posta OECE)")
+    p = argparse.ArgumentParser(
+        description="Delta SEACE PROD2: radar 48–72h + ficha solo de nomenclaturas nuevas no bloqueadas"
+    )
+    p.add_argument("--desde", help="Fecha inicio DD/MM/YYYY o YYYY-MM-DD (default: radar 72h)")
     p.add_argument("--hasta", help="Fecha fin (default: hoy)")
     p.add_argument("--year", default=ANIO)
     p.add_argument("--objeto", default=OBJETO, help="Bien|Obra|Servicio|Consultoría de Obra. Vacío=todos")
     p.add_argument("--nomenclaturas-file", default=HANDOFF_DEFAULT or None, help="JSON/TXT de nomenclaturas OECE para deduplicar")
     p.add_argument("--max-fichas", type=int, default=MAX_FICHAS_POR_CORRIDA)
     p.add_argument("--modo", default=MODO, choices=("sync", "backfill"))
+    p.add_argument(
+        "--horas-radar",
+        type=int,
+        default=None,
+        help="Ventana de publicación en horas (default EMBUDO_HORAS_RADAR o 72)",
+    )
     return p.parse_args()
 
 
@@ -1167,19 +1183,12 @@ if __name__ == "__main__":
     if objeto is not None and objeto.strip() == "":
         objeto = None
 
-    if not args.desde and args.nomenclaturas_file:
-        hp = Path(args.nomenclaturas_file)
-        if hp.exists() and hp.suffix.lower() == ".json":
-            try:
-                h = json.loads(hp.read_text(encoding="utf-8"))
-                args.desde = h.get("fecha_max_seace") or h.get("fecha_max")
-                print(f"[*] fecha_max desde handoff: {args.desde}")
-            except Exception as e:
-                print(f"[!] No se pudo leer fecha del handoff: {e}")
+    if args.horas_radar:
+        globals()["HORAS_RADAR"] = max(24, int(args.horas_radar))
 
     print(
-        f"=== SEACE | MODO={args.modo} | ROWS={ROWS} | "
-        f"FICHAS_EN_PAGINA=True | max={args.max_fichas or 'ilimitado'} ==="
+        f"=== SEACE PROD2 | MODO={args.modo} | ROWS={ROWS} | "
+        f"radar={HORAS_RADAR}h | max_fichas={args.max_fichas or 'ilimitado'} ==="
     )
     conn = db_connect()
     print(f"[*] DB {DB_FILE.name}: {db_count(conn)} registros")
@@ -1187,7 +1196,7 @@ if __name__ == "__main__":
     if args.desde:
         fecha_ini = fecha_iso_a_seace(args.desde)
         fecha_fin = fecha_iso_a_seace(args.hasta) if args.hasta else date.today().strftime("%d/%m/%Y")
-        print(f"[*] Ventana delta (posta OECE): {fecha_ini} .. {fecha_fin}")
+        print(f"[*] Ventana explícita: {fecha_ini} .. {fecha_fin}")
     else:
         fecha_ini, fecha_fin = resolver_ventana(conn)
 

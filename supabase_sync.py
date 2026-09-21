@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import os
 from datetime import datetime, timezone
+from lib_embudo import es_estado_terminal
 from pathlib import Path
 
 try:
@@ -155,7 +156,7 @@ def convocatoria_from_oece_lead(lead):
         )
     if not nom_norm:
         return None
-    return {
+    row = {
         "nomenclatura_norm": nom_norm,
         "nomenclatura": nom_raw or nom_norm,
         "entidad": lead.get("Entidad Convocante") or "",
@@ -171,35 +172,93 @@ def convocatoria_from_oece_lead(lead):
         "file_code": None,
         "nid_convocatoria": None,
         "nid_proceso": None,
+        "tipo_procedimiento": lead.get("Tipo Procedimiento") or "",
+        "categoria": lead.get("Categoría") or lead.get("Categoria") or "",
+        "estado": lead.get("Estado") or "",
         "updated_at": _now(),
     }
+    if lead.get("Bloqueada") is True or lead.get("Bloqueada") in ("1", "true", "True"):
+        row["bloqueada"] = True
+    elif es_estado_terminal(row.get("estado")):
+        row["bloqueada"] = True
+    return row
 
 
-def proveedor_from_oece_lead(lead):
-    ruc = str(lead.get("RUC") or "").strip()
+def proveedor_from_oece_lead(lead, ficha=None):
+    ruc = str(lead.get("RUC") or "").replace("PE-RUC-", "").strip()
     nom_norm = lead.get("Nomenclatura Norma") or normalizar_nomenclatura(lead.get("Nomenclatura"))
     if not ruc or not nom_norm:
         return None
+    ficha = ficha or {}
+    tel = (
+        ficha.get("telefono_rnp")
+        or ficha.get("telefono")
+        or lead.get("Teléfono / Celular (RNP)")
+        or ""
+    )
+    mail = (
+        ficha.get("email_rnp")
+        or ficha.get("email")
+        or lead.get("Email de Contacto (RNP)")
+        or ""
+    )
     return {
         "ruc": ruc,
         "nomenclatura_norm": nom_norm,
         "razon_social": lead.get("Razón Social") or "",
         "condicion": lead.get("Condición") or "",
-        "telefono": lead.get("Teléfono / Celular (RNP)") or "",
-        "email": lead.get("Email de Contacto (RNP)") or "",
+        "telefono": tel,
+        "email": mail,
+        "telefono_rnp": tel,
+        "email_rnp": mail,
+        "departamento": ficha.get("departamento") or lead.get("Departamento") or "",
+        "provincia": ficha.get("provincia") or lead.get("Provincia") or "",
+        "distrito": ficha.get("distrito") or lead.get("Distrito") or "",
+        "estado_sunat": (
+            ficha.get("estado_sunat") or lead.get("Estado SUNAT") or "N/D"
+        ),
+        "condicion_domicilio": (
+            ficha.get("condicion_domicilio")
+            or lead.get("Condición Domicilio")
+            or "N/D"
+        ),
+        "habilitado_rnp": (
+            ficha.get("habilitado_rnp") or lead.get("Habilitado RNP") or "No"
+        ),
+        "apto_contratar": (
+            ficha.get("apto_contratar") or lead.get("Apto para Contratar") or "No"
+        ),
+        "ficha_rnp_url": ficha.get("ficha_rnp_url") or lead.get("Ficha RNP (Web)") or "",
         "updated_at": _now(),
     }
 
 
-def upsert_oece_leads(leads):
+def upsert_oece_leads(leads, enriquecer=True):
+    """
+    Upsert OECE. Si enriquecer=True (default) consulta RNP+SUNAT por RUC
+    único ANTES de insertar en proveedores: estado_sunat, condicion_rnp
+    (habilitado/apto) y teléfonos/emails.
+    """
     convs, seen = [], set()
+    fichas = {}
+    if enriquecer and os.environ.get("ENRIQUECER_PROVEEDORES", "1").lower() not in (
+        "0", "false", "no",
+    ):
+        try:
+            from enriquecer_proveedor import enriquecer_rucs
+
+            fichas = enriquecer_rucs(l.get("RUC") for l in leads)
+        except Exception as e:
+            print(f"[!] Enriquecimiento RNP/SUNAT falló, se inserta ficha vacía: {e}")
+
     provs = []
     for lead in leads:
         c = convocatoria_from_oece_lead(lead)
         if c and c["nomenclatura_norm"] not in seen:
             seen.add(c["nomenclatura_norm"])
             convs.append(c)
-        p = proveedor_from_oece_lead(lead)
+        ruc = str(lead.get("RUC") or "").replace("PE-RUC-", "").strip()
+        p = proveedor_from_oece_lead(lead, fichas.get(ruc))
         if p:
             provs.append(p)
     upsert_rows("convocatorias", convs, "nomenclatura_norm")
@@ -231,6 +290,8 @@ def upsert_seace_fila(fila, extra=None):
         "nid_proceso": fila.get("nid_proceso"),
         "updated_at": _now(),
     }
+    if es_estado_terminal(fila.get("estado") or extra.get("estado")):
+        row["bloqueada"] = True
     upsert_rows("convocatorias", [row], "nomenclatura_norm")
     return nom_norm
 
@@ -266,6 +327,29 @@ def upsert_documentos(nom_norm, docs):
     return upsert_rows("documentos_proceso", rows, "file_id")
 
 
+def nomenclaturas_bloqueadas():
+    """Nomenclaturas que OECE marcó terminales: PROD2/PROD6 no las tocan."""
+    client = get_client()
+    known = set()
+    start = 0
+    while True:
+        res = (
+            client.table("convocatorias")
+            .select("nomenclatura_norm")
+            .eq("bloqueada", True)
+            .range(start, start + 999)
+            .execute()
+        )
+        data = res.data or []
+        for row in data:
+            if row.get("nomenclatura_norm"):
+                known.add(row["nomenclatura_norm"])
+        if len(data) < 1000:
+            break
+        start += 1000
+    return known
+
+
 def nomenclaturas_en_nube(fuente=None):
     """Set de nomenclaturas normalizadas ya cargadas (llave de deduplicación)."""
     client = get_client()
@@ -298,7 +382,23 @@ def contar_convocatorias(fuente=None):
 # ---------------------------------------------------------------------------
 # PROD6 — Compras Menores (<= 8 UIT), API REST pública sin CAPTCHA
 # ---------------------------------------------------------------------------
-def convocatoria_from_prod6(cab, resumen=None):
+# idEtapaContrato en uitContratoEtapaProjectionList (JS del buscador público).
+PROD6_ETAPA_CONSULTAS = 1
+PROD6_ETAPA_COTIZACION = 2
+PROD6_ARCHIVO_BASE = (
+    "https://prod6.seace.gob.pe/v1/s8uit-services/archivo"
+    "/archivos-publico/descargar-archivo-contrato"
+)
+
+
+def _etapa_por_id(etapas, id_etapa):
+    for et in etapas or []:
+        if int(et.get("idEtapaContrato") or 0) == id_etapa:
+            return et
+    return {}
+
+
+def convocatoria_from_prod6(cab, resumen=None, etapas=None, docs=None):
     """
     Mapea uitContratoCompletoProjection (+ fila del buscador) a convocatorias.
     La llave sigue siendo nomenclatura_norm (nroDescripcion normalizado).
@@ -314,9 +414,17 @@ def convocatoria_from_prod6(cab, resumen=None):
         if cab.get("montoContrato") is not None
         else resumen.get("montoContrato")
     )
+    consulta = _etapa_por_id(etapas, PROD6_ETAPA_CONSULTAS)
+    cotiza = _etapa_por_id(etapas, PROD6_ETAPA_COTIZACION)
+    url_bases = ""
+    file_code = None
+    if docs:
+        primero = docs[0]
+        url_bases = primero.get("url_descarga") or ""
+        file_code = primero.get("file_code")
     # requiere_iso se omite a propósito: lo pone el DEFAULT en el INSERT y así
     # un re-upsert no pisa el estado de desbloqueo del usuario.
-    return {
+    row = {
         "nomenclatura_norm": nom_norm,
         "nomenclatura": nom_raw,
         "entidad": cab.get("nomEntidad") or resumen.get("nomEntidad") or "",
@@ -332,16 +440,66 @@ def convocatoria_from_prod6(cab, resumen=None):
         "fuente": "PROD6",
         "estado": cab.get("nomEstadoContrato") or resumen.get("nomEstadoContrato") or "",
         "id_contrato": None if id_contrato is None else str(id_contrato),
-        "fecha_fin_cotizacion": _fecha_iso(resumen.get("fecFinCotizacion")),
+        "tipo_procedimiento": "Contratación menor (≤ 8 UIT)",
+        "categoria": cab.get("nomObjetoContrato") or resumen.get("nomObjetoContrato") or "",
+        "fecha_inicio_consultas": _fecha_iso(consulta.get("fecIni")),
+        "fecha_fin_consultas": _fecha_iso(consulta.get("fecFin")),
+        "fecha_inicio_cotizacion": _fecha_iso(cotiza.get("fecIni")),
+        "fecha_fin_cotizacion": _fecha_iso(
+            cotiza.get("fecFin") or resumen.get("fecFinCotizacion")
+        ),
+        # Ruta pública del buscador (SPA). /compras-menores/detalle/{id} es
+        # el microfrontend autenticado: sin sesión la página queda en blanco.
         "ficha_url": (
-            f"https://prod6.seace.gob.pe/compras-menores/detalle/{id_contrato}"
+            f"https://prod6.seace.gob.pe/buscador-publico/contrataciones/{id_contrato}"
             if id_contrato
             else ""
         ),
-        "url_bases": "",
-        "file_code": None,
+        "url_bases": url_bases,
+        "file_code": file_code,
         "updated_at": _now(),
     }
+    if es_estado_terminal(row["estado"]):
+        row["bloqueada"] = True
+    return row
+
+
+def cronograma_from_prod6(nom_norm, etapas):
+    filas = []
+    for et in etapas or []:
+        id_etapa = et.get("idEtapaContrato")
+        if id_etapa is None:
+            continue
+        filas.append({
+            "nomenclatura_norm": nom_norm,
+            "id_etapa": int(id_etapa),
+            "nombre_etapa": et.get("nomEtapaContrato") or "",
+            "fecha_inicio": _fecha_iso(et.get("fecIni")),
+            "fecha_fin": _fecha_iso(et.get("fecFin")),
+            "updated_at": _now(),
+        })
+    return filas
+
+
+def documentos_from_prod6(nom_norm, docs):
+    filas = []
+    for doc in docs or []:
+        file_id = doc.get("file_id") or doc.get("file_code")
+        if not file_id:
+            continue
+        filas.append({
+            "file_id": str(file_id),
+            "nomenclatura_norm": nom_norm,
+            "categoria": doc.get("categoria") or "requerimiento",
+            "documento": doc.get("documento") or "Requerimiento / Bases",
+            "nombre_archivo": doc.get("nombre_archivo") or "",
+            "file_code": str(doc.get("file_code") or file_id),
+            "url_descarga": doc.get("url_descarga") or (
+                f"{PROD6_ARCHIVO_BASE}/{file_id}"
+            ),
+            "updated_at": _now(),
+        })
+    return filas
 
 
 def items_from_prod6(nom_norm, items):
@@ -364,33 +522,52 @@ def items_from_prod6(nom_norm, items):
     return filas
 
 
-def upsert_prod6_proceso(cab, resumen=None, items=None):
-    """Inserta una compra menor + sus ítems. Devuelve nomenclatura_norm o None."""
-    conv = convocatoria_from_prod6(cab, resumen)
+def upsert_prod6_proceso(cab, resumen=None, items=None, etapas=None, docs=None):
+    """Inserta una compra menor + ítems + cronograma + docs. Devuelve nomenclatura_norm."""
+    conv = convocatoria_from_prod6(cab, resumen, etapas=etapas, docs=docs)
     if not conv:
         return None
     if not upsert_rows("convocatorias", [conv], "nomenclatura_norm"):
         return None
-    filas = items_from_prod6(conv["nomenclatura_norm"], items)
+    nom = conv["nomenclatura_norm"]
+    filas = items_from_prod6(nom, items)
     if filas:
         upsert_rows("items_proceso", filas, "nomenclatura_norm,secuencia")
-    return conv["nomenclatura_norm"]
+    crono = cronograma_from_prod6(nom, etapas)
+    if crono:
+        upsert_rows("cronograma_proceso", crono, "nomenclatura_norm,id_etapa")
+    docs_rows = documentos_from_prod6(nom, docs)
+    if docs_rows:
+        upsert_rows("documentos_proceso", docs_rows, "file_id")
+    return nom
 
 
 def upsert_prod6_lote(procesos):
     """
-    procesos: lista de dicts {cab, resumen, items}. Hace el upsert en bloque
-    (convocatorias primero por la FK de items_proceso).
+    procesos: lista de dicts {cab, resumen, items, etapas, docs}.
+    Upsert en bloque: convocatorias primero por las FK.
     """
-    convs, items, vistos = [], [], set()
+    convs, items, cronos, docs_all, vistos = [], [], [], [], set()
     for p in procesos:
-        conv = convocatoria_from_prod6(p.get("cab") or {}, p.get("resumen"))
+        conv = convocatoria_from_prod6(
+            p.get("cab") or {},
+            p.get("resumen"),
+            etapas=p.get("etapas"),
+            docs=p.get("docs"),
+        )
         if not conv or conv["nomenclatura_norm"] in vistos:
             continue
         vistos.add(conv["nomenclatura_norm"])
+        nom = conv["nomenclatura_norm"]
         convs.append(conv)
-        items.extend(items_from_prod6(conv["nomenclatura_norm"], p.get("items")))
+        items.extend(items_from_prod6(nom, p.get("items")))
+        cronos.extend(cronograma_from_prod6(nom, p.get("etapas")))
+        docs_all.extend(documentos_from_prod6(nom, p.get("docs")))
     ok = upsert_rows("convocatorias", convs, "nomenclatura_norm")
     if items:
         upsert_rows("items_proceso", items, "nomenclatura_norm,secuencia")
+    if cronos:
+        upsert_rows("cronograma_proceso", cronos, "nomenclatura_norm,id_etapa")
+    if docs_all:
+        upsert_rows("documentos_proceso", docs_all, "file_id")
     return ok, len(items)

@@ -28,6 +28,8 @@ respuesta_pagina*.xml
 error_get.html
 ficha_post_error.html
 buscador_probe.html
+logs/
+radar_nuevas.json
 
 # Salidas OECE / pipeline
 prospectos_seace_*.csv
