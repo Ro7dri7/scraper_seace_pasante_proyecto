@@ -26,8 +26,12 @@ import time
 import warnings
 from datetime import date, datetime, timedelta, timezone
 
+import socket
+
 import requests
 from bs4 import BeautifulSoup, XMLParsedAsHTMLWarning
+from requests.exceptions import RequestException, Timeout
+from urllib3.exceptions import ProtocolError, ReadTimeoutError
 
 from captcha_2captcha import (
     CaptchaError,
@@ -96,6 +100,16 @@ DIAS_SOLAPE = _env_int("SEACE_DIAS_SOLAPE", 1)
 ROWS = _env_int("SEACE_ROWS", 20)
 SLEEP_SEC = _env_float("SEACE_SLEEP_SEC", 1.2)
 MAX_PAGES = _env_int("SEACE_MAX_PAGES", None)
+# (connect, read): un socket colgado de Oracle no puede bloquear el pipeline.
+HTTP_TIMEOUT = (15, 30)
+HTTP_REINTENTOS = 3
+HTTP_EXCEPCIONES = (
+    RequestException,
+    Timeout,
+    ReadTimeoutError,
+    ProtocolError,
+    socket.timeout,
+)
 GUARDAR_XML_PAGINAS = _env_bool("SEACE_GUARDAR_XML", False)
 
 PROCESAR_FICHAS_NUEVAS = _env_bool("SEACE_PROCESAR_FICHAS", True)
@@ -137,8 +151,25 @@ class Seace:
         self.sitekey = None
         self.refresh()
 
+    def _http(self, method, url, **kwargs):
+        """GET/POST con timeout corto y hasta 3 reintentos. No traga KeyboardInterrupt."""
+        kwargs.setdefault("timeout", HTTP_TIMEOUT)
+        ultimo = None
+        for intento in range(1, HTTP_REINTENTOS + 1):
+            try:
+                return self.s.request(method, url, **kwargs)
+            except HTTP_EXCEPCIONES as e:
+                ultimo = e
+                print(
+                    f"  [!] HTTP {method} intento {intento}/{HTTP_REINTENTOS}: {e}"
+                )
+                if intento >= HTTP_REINTENTOS:
+                    break
+                time.sleep(min(8.0, 1.5 ** intento))
+        raise ultimo or RuntimeError(f"HTTP {method} falló sin excepción capturada")
+
     def refresh(self):
-        r = self.s.get(self.page, timeout=60)
+        r = self._http("GET", self.page)
         if r.status_code == 403:
             raise RuntimeError(
                 "WAF 403 en PROD2. El proxy IPRoyal no está activo, "
@@ -218,7 +249,7 @@ class Seace:
         data = self._merge_form_fields(data)
         if extra:
             data.update(extra)
-        r = self.s.post(self.page, data=data, headers=self._headers_ajax(), timeout=120)
+        r = self._http("POST", self.page, data=data, headers=self._headers_ajax())
         r.raise_for_status()
         self._absorb_viewstate(r.text)
         return r.text
@@ -291,7 +322,7 @@ class Seace:
         data[f"{DT}_encodeFeature"] = "true"
         data["javax.faces.ViewState"] = self._vs
 
-        r = self.s.post(self.page, data=data, headers=self._headers_ajax(), timeout=120)
+        r = self._http("POST", self.page, data=data, headers=self._headers_ajax())
         r.raise_for_status()
         self._absorb_viewstate(r.text)
         return r.text
@@ -333,9 +364,8 @@ class Seace:
             "Referer": self.page,
             "Upgrade-Insecure-Requests": "1",
         }
-        r = self.s.post(
-            self.page, data=data, headers=headers,
-            allow_redirects=False, timeout=120,
+        r = self._http(
+            "POST", self.page, data=data, headers=headers, allow_redirects=False,
         )
         ficha_markers = ("tbFicha:dtDocumentos", "fichaSeleccion", "dtDocumentos_data")
         if r.status_code == 200 and any(m in (r.text or "") for m in ficha_markers):
@@ -355,13 +385,28 @@ class Seace:
         if "fichaSeleccion.xhtml" not in loc:
             raise RuntimeError(f"Redirect inesperado: {loc}")
 
-        rf = self.s.get(loc, headers={
+        rf = self._http("GET", loc, headers={
             "User-Agent": self.s.headers.get("User-Agent"),
             "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
             "Referer": self.page,
-        }, timeout=120)
+        })
         rf.raise_for_status()
         return loc, rf.text
+
+    def descargar_archivo(self, url, dest=None):
+        """GET de Alfresco/SEACE con el mismo timeout y reintentos. No se usa
+        en el embudo (on-demand); queda para no colgar si se llama a mano."""
+        r = self._http("GET", url, stream=True)
+        r.raise_for_status()
+        if dest:
+            dest = Path(dest)
+            dest.parent.mkdir(parents=True, exist_ok=True)
+            with dest.open("wb") as fh:
+                for chunk in r.iter_content(chunk_size=65536):
+                    if chunk:
+                        fh.write(chunk)
+            return dest
+        return r.content
 
 # ---------------------------------------------------------------------------
 # Parseo
@@ -979,17 +1024,27 @@ def barrer_listado(seace, conn, token, fecha_ini, fecha_fin, known_oece=None,
                     procesar_ficha_y_docs(seace, fila, conn)
                     fichas_hechas.add(nid)
                     fichas_ok += 1
+                except HTTP_EXCEPCIONES as e:
+                    print(
+                        f"  [!] Ficha omitida (timeout/red, se continúa): "
+                        f"{fila.get('nomenclatura')} — {e}"
+                    )
+                    fichas_hechas.add(nid)
                 except Exception as e:
                     print(f"  [-] Error ficha {fila.get('nomenclatura')}: {e}")
                     fichas_hechas.add(nid)
                 # Volver al listado (el POST de ficha invalidó el ViewState)
-                seace.refresh()
-                filas, total = _buscar_pagina(
-                    seace, token_holder, fecha_ini, fecha_fin, page_idx, anio, version, objeto
-                )
-                pages = math.ceil(total / ROWS) if total else pages
-                if MAX_PAGES is not None:
-                    pages = min(pages, MAX_PAGES)
+                try:
+                    seace.refresh()
+                    filas, total = _buscar_pagina(
+                        seace, token_holder, fecha_ini, fecha_fin, page_idx, anio, version, objeto
+                    )
+                    pages = math.ceil(total / ROWS) if total else pages
+                    if MAX_PAGES is not None:
+                        pages = min(pages, MAX_PAGES)
+                except HTTP_EXCEPCIONES as e:
+                    print(f"  [!] No se pudo restaurar el listado tras la ficha: {e}")
+                    break
 
         if max_fichas is not None and fichas_ok >= max_fichas:
             print(f"[*] Tope de fichas alcanzado ({max_fichas})")
