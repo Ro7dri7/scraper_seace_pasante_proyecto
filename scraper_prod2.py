@@ -30,8 +30,15 @@ import socket
 
 import requests
 from bs4 import BeautifulSoup, XMLParsedAsHTMLWarning
+from requests.adapters import HTTPAdapter
+from requests.exceptions import ConnectionError as RequestsConnectionError
 from requests.exceptions import RequestException, Timeout
 from urllib3.exceptions import ProtocolError, ReadTimeoutError
+
+try:
+    from urllib3.util.retry import Retry
+except ImportError:  # urllib3 < 1.26
+    from urllib3.util import Retry
 
 from captcha_2captcha import (
     CaptchaError,
@@ -106,9 +113,14 @@ HTTP_REINTENTOS = 3
 HTTP_EXCEPCIONES = (
     RequestException,
     Timeout,
+    RequestsConnectionError,
     ReadTimeoutError,
     ProtocolError,
     socket.timeout,
+)
+# POST tiene que reintentarse: SEACE pagina y abre fichas con ViewState vía POST.
+_RETRY_METHODS = frozenset(
+    {"HEAD", "GET", "PUT", "DELETE", "OPTIONS", "TRACE", "POST"}
 )
 GUARDAR_XML_PAGINAS = _env_bool("SEACE_GUARDAR_XML", False)
 
@@ -127,6 +139,29 @@ else:
     HANDOFF_DEFAULT = str(Path(__file__).with_name("handoff_state.json"))
 
 
+def _retry_urllib3():
+    """Retry compatible con urllib3 nuevo (allowed_methods) y viejo (method_whitelist)."""
+    kwargs = {
+        "total": 5,
+        "connect": 5,
+        "read": 5,
+        "backoff_factor": 2,
+        "status_forcelist": [500, 502, 503, 504],
+        "raise_on_status": False,
+    }
+    try:
+        return Retry(allowed_methods=_RETRY_METHODS, **kwargs)
+    except TypeError:
+        return Retry(method_whitelist=_RETRY_METHODS, **kwargs)
+
+
+def _montar_adaptador_reintentos(session):
+    adapter = HTTPAdapter(max_retries=_retry_urllib3())
+    session.mount("https://", adapter)
+    session.mount("http://", adapter)
+    return session
+
+
 # ---------------------------------------------------------------------------
 # Cliente SEACE
 # ---------------------------------------------------------------------------
@@ -135,6 +170,7 @@ class Seace:
         self.host = host
         self.page = f"{host}/seacebus-uiwd-pub/buscadorPublico/buscadorPublico.xhtml"
         self.s = requests.Session()
+        _montar_adaptador_reintentos(self.s)
         self.s.headers.update({
             "User-Agent": (
                 "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
@@ -152,20 +188,27 @@ class Seace:
         self.refresh()
 
     def _http(self, method, url, **kwargs):
-        """GET/POST con timeout corto y hasta 3 reintentos. No traga KeyboardInterrupt."""
-        kwargs.setdefault("timeout", HTTP_TIMEOUT)
+        """GET/POST: timeout obligatorio + reintentos. No traga KeyboardInterrupt."""
+        if kwargs.get("timeout") is None:
+            kwargs["timeout"] = HTTP_TIMEOUT
         ultimo = None
         for intento in range(1, HTTP_REINTENTOS + 1):
             try:
                 return self.s.request(method, url, **kwargs)
+            except (Timeout, RequestsConnectionError) as e:
+                ultimo = e
+                print(
+                    "[!] Timeout en SEACE, reintentando o saltando... "
+                    f"({method} {intento}/{HTTP_REINTENTOS}: {e})"
+                )
             except HTTP_EXCEPCIONES as e:
                 ultimo = e
                 print(
                     f"  [!] HTTP {method} intento {intento}/{HTTP_REINTENTOS}: {e}"
                 )
-                if intento >= HTTP_REINTENTOS:
-                    break
-                time.sleep(min(8.0, 1.5 ** intento))
+            if intento >= HTTP_REINTENTOS:
+                break
+            time.sleep(min(8.0, 1.5 ** intento))
         raise ultimo or RuntimeError(f"HTTP {method} falló sin excepción capturada")
 
     def refresh(self):
@@ -322,8 +365,15 @@ class Seace:
         data[f"{DT}_encodeFeature"] = "true"
         data["javax.faces.ViewState"] = self._vs
 
-        r = self._http("POST", self.page, data=data, headers=self._headers_ajax())
-        r.raise_for_status()
+        try:
+            r = self._http("POST", self.page, data=data, headers=self._headers_ajax())
+            r.raise_for_status()
+        except (Timeout, RequestsConnectionError) as e:
+            print(
+                f"[!] Timeout en SEACE, reintentando o saltando... "
+                f"(paginar first={first}: {e})"
+            )
+            raise
         self._absorb_viewstate(r.text)
         return r.text
 
@@ -920,6 +970,19 @@ def resolver_ventana(conn):
 
 def _buscar_pagina(seace, token_holder, fecha_ini, fecha_fin, page_idx, anio, version, objeto):
     """GET fresco + buscar + saltar a page_idx. Renueva captcha si el listado viene vacío."""
+    try:
+        return _buscar_pagina_inner(
+            seace, token_holder, fecha_ini, fecha_fin, page_idx, anio, version, objeto
+        )
+    except (Timeout, RequestsConnectionError) as e:
+        print(
+            f"[!] Timeout en SEACE, reintentando o saltando... "
+            f"(listado pág.{page_idx + 1}: {e})"
+        )
+        raise
+
+
+def _buscar_pagina_inner(seace, token_holder, fecha_ini, fecha_fin, page_idx, anio, version, objeto):
     xml = seace.buscar(token_holder[0], anio, fecha_ini, fecha_fin, version, objeto)
     filas, total = parse_resultados(xml)
     if page_idx == 0:
@@ -962,9 +1025,13 @@ def barrer_listado(seace, conn, token, fecha_ini, fecha_fin, known_oece=None,
     fichas_ok = 0
     fichas_hechas = set()
 
-    filas, total = _buscar_pagina(
-        seace, token_holder, fecha_ini, fecha_fin, 0, anio, version, objeto
-    )
+    try:
+        filas, total = _buscar_pagina(
+            seace, token_holder, fecha_ini, fecha_fin, 0, anio, version, objeto
+        )
+    except (Timeout, RequestsConnectionError, HTTP_EXCEPCIONES) as e:
+        print(f"[!] Timeout en SEACE, reintentando o saltando... (página 1: {e})")
+        return [], [], 0
     Path("respuesta_test.xml").write_text("", encoding="utf-8")
     print(f"[*] Página 1: {len(filas)} filas | total servidor={total}")
     if not filas and total == 0:
@@ -981,9 +1048,18 @@ def barrer_listado(seace, conn, token, fecha_ini, fecha_fin, known_oece=None,
 
     while page_idx < pages:
         if page_idx > 0 and not filas:
-            filas, total = _buscar_pagina(
-                seace, token_holder, fecha_ini, fecha_fin, page_idx, anio, version, objeto
-            )
+            try:
+                filas, total = _buscar_pagina(
+                    seace, token_holder, fecha_ini, fecha_fin, page_idx,
+                    anio, version, objeto,
+                )
+            except (Timeout, RequestsConnectionError, HTTP_EXCEPCIONES) as e:
+                print(
+                    f"[!] Timeout en SEACE, reintentando o saltando... "
+                    f"(pág.{page_idx + 1}: {e})"
+                )
+                page_idx += 1
+                continue
         if not filas:
             print(f"[-] Página {page_idx + 1} vacía — stop")
             break
@@ -1042,8 +1118,11 @@ def barrer_listado(seace, conn, token, fecha_ini, fecha_fin, known_oece=None,
                     pages = math.ceil(total / ROWS) if total else pages
                     if MAX_PAGES is not None:
                         pages = min(pages, MAX_PAGES)
-                except HTTP_EXCEPCIONES as e:
-                    print(f"  [!] No se pudo restaurar el listado tras la ficha: {e}")
+                except (Timeout, RequestsConnectionError, HTTP_EXCEPCIONES) as e:
+                    print(
+                        f"[!] Timeout en SEACE, reintentando o saltando... "
+                        f"(restaurar listado: {e})"
+                    )
                     break
 
         if max_fichas is not None and fichas_ok >= max_fichas:
@@ -1055,15 +1134,43 @@ def barrer_listado(seace, conn, token, fecha_ini, fecha_fin, known_oece=None,
             break
         time.sleep(SLEEP_SEC)
         print(f"[*] paginar first={page_idx * ROWS} ({page_idx + 1}/{pages})...")
-        xml_p = seace.paginar(page_idx * ROWS, ROWS)
-        if GUARDAR_XML_PAGINAS:
-            Path(f"respuesta_pagina{page_idx + 1}.xml").write_text(xml_p, encoding="utf-8")
-        filas, _ = parse_resultados(xml_p)
-        if not filas:
-            seace.refresh()
-            filas, total = _buscar_pagina(
-                seace, token_holder, fecha_ini, fecha_fin, page_idx, anio, version, objeto
+        try:
+            xml_p = seace.paginar(page_idx * ROWS, ROWS)
+        except (Timeout, RequestsConnectionError, HTTP_EXCEPCIONES) as e:
+            print(
+                f"[!] Timeout en SEACE, reintentando o saltando... "
+                f"(pág.{page_idx + 1} first={page_idx * ROWS}: {e})"
             )
+            try:
+                seace.refresh()
+                filas, total = _buscar_pagina(
+                    seace, token_holder, fecha_ini, fecha_fin, page_idx,
+                    anio, version, objeto,
+                )
+            except (Timeout, RequestsConnectionError, HTTP_EXCEPCIONES) as e2:
+                print(f"[!] Página {page_idx + 1} omitida; se avanza. ({e2})")
+                filas = []
+                continue
+        else:
+            if GUARDAR_XML_PAGINAS:
+                Path(f"respuesta_pagina{page_idx + 1}.xml").write_text(
+                    xml_p, encoding="utf-8"
+                )
+            filas, _ = parse_resultados(xml_p)
+        if not filas:
+            try:
+                seace.refresh()
+                filas, total = _buscar_pagina(
+                    seace, token_holder, fecha_ini, fecha_fin, page_idx,
+                    anio, version, objeto,
+                )
+            except (Timeout, RequestsConnectionError, HTTP_EXCEPCIONES) as e:
+                print(
+                    f"[!] Timeout en SEACE, reintentando o saltando... "
+                    f"(restaurar pág.{page_idx + 1}: {e})"
+                )
+                filas = []
+                continue
 
     conn.commit()
     return todas, nuevas_all, total
