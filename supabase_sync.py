@@ -2,9 +2,9 @@
 Cliente Supabase: upsert a convocatorias / documentos_proceso / items_proceso /
 proveedores.
 
-Estrategia on-demand: aquí NUNCA se descarga un binario. De cada documento se
-persiste el file_code y la URL de descarga de Alfresco; el PDF/ZIP se resuelve
-asíncronamente cuando el usuario desbloquea la licitación en el frontend.
+Estrategia on-demand: aquí NUNCA se descarga un binario. De cada documento
+PROD2 se persiste el file_code y la URL pública de SeaceWeb-PRO
+(SdescargarArchivoAlfresco), que sí entrega el PDF/ZIP al abrirla.
 """
 from __future__ import annotations
 
@@ -65,11 +65,29 @@ def _alfresco_base():
     ).strip().rstrip("/")
 
 
+def _prod1_base():
+    return (
+        os.environ.get("SEACE_PROD1") or "https://prod1.seace.gob.pe"
+    ).strip().rstrip("/")
+
+
+def construir_url_descarga_prod2(file_code):
+    """
+    URL de descarga directa de Bases / docs PROD2 (mismo servlet que usa
+    seace-delta-aws). Alfresco downloadDoc exige sesión y no sirve como link.
+    """
+    if not file_code:
+        return ""
+    return (
+        f"{_prod1_base()}/SeaceWeb-PRO/SdescargarArchivoAlfresco"
+        f"?fileCode={file_code}"
+    )
+
+
 def construir_url_alfresco(file_code):
     """
-    URL dinámica de descarga (no se invoca aquí). Es el resolver JSONP de
-    Alfresco: devuelve un downloadUrl con alf_ticket fresco, así que la URL
-    guardada no caduca y sirve para el desbloqueo posterior.
+    Resolver JSONP de Alfresco (legado). Preferir construir_url_descarga_prod2
+    para persistir url_bases / url_descarga de PROD2.
     """
     if not file_code:
         return ""
@@ -272,6 +290,10 @@ def upsert_seace_fila(fila, extra=None):
     nom_norm = fila.get("nomenclatura_norm") or normalizar_nomenclatura(nom)
     if not nom_norm:
         return None
+    file_code = extra.get("file_code") or fila.get("file_code") or ""
+    url_bases = extra.get("url_bases") or fila.get("url_bases") or ""
+    if not url_bases or "downloadDoc" in url_bases:
+        url_bases = construir_url_descarga_prod2(file_code) or url_bases
     row = {
         "nomenclatura_norm": nom_norm,
         "nomenclatura": nom,
@@ -284,8 +306,8 @@ def upsert_seace_fila(fila, extra=None):
         "fuente": fila.get("fuente") or "seace",
         "ocid": None,
         "ficha_url": extra.get("ficha_url") or fila.get("ficha_url") or "",
-        "url_bases": extra.get("url_bases") or fila.get("url_bases") or "",
-        "file_code": extra.get("file_code") or fila.get("file_code") or "",
+        "url_bases": url_bases,
+        "file_code": file_code,
         "nid_convocatoria": fila.get("nid_convocatoria"),
         "nid_proceso": fila.get("nid_proceso"),
         "updated_at": _now(),
@@ -297,11 +319,14 @@ def upsert_seace_fila(fila, extra=None):
 
 
 def documento_row(nom_norm, doc):
-    """Fila on-demand: file_code + URL Alfresco. Nunca ruta local ni bytes."""
+    """Fila on-demand: file_code + URL de descarga. Nunca ruta local ni bytes."""
     file_id = doc.get("file_id") or doc.get("file_code")
     if not file_id or not nom_norm:
         return None
     file_code = doc.get("file_code") or file_id
+    url = (doc.get("url_descarga") or "").strip()
+    if not url or "downloadDoc" in url:
+        url = construir_url_descarga_prod2(file_code) or url
     return {
         "file_id": file_id,
         "nomenclatura_norm": nom_norm,
@@ -309,7 +334,7 @@ def documento_row(nom_norm, doc):
         "documento": doc.get("documento") or "",
         "nombre_archivo": doc.get("nombre_archivo") or "",
         "file_code": file_code,
-        "url_descarga": doc.get("url_descarga") or construir_url_alfresco(file_code),
+        "url_descarga": url,
         "updated_at": _now(),
     }
 

@@ -9,8 +9,8 @@ reCAPTCHA: 2Captcha (TWOCAPTCHA_API_KEY). Las fichas se abren en la
 misma página del listado, antes de paginar, para no invalidar el ViewState.
 
 Estrategia on-demand: NO se descarga ningún PDF/ZIP. De cada documento de la
-ficha se guarda el file_code y la URL de descarga de Alfresco; el binario se
-resuelve más adelante, solo cuando un usuario desbloquea la licitación.
+ficha se guarda el file_code y la URL pública de SeaceWeb-PRO
+(SdescargarArchivoAlfresco), que abre la descarga directa.
 """
 from __future__ import annotations
 
@@ -50,7 +50,7 @@ from captcha_2captcha import (
 from lib_embudo import horas_radar_default
 from lib_nomenclatura import normalizar_nomenclatura
 from proxy_iproyal import aplicar_proxy, log_proxy_status, proxy_para_2captcha
-from supabase_sync import construir_url_alfresco
+from supabase_sync import construir_url_descarga_prod2
 
 warnings.filterwarnings("ignore", category=XMLParsedAsHTMLWarning)
 
@@ -672,7 +672,8 @@ def parse_documentos(ficha_html):
     """
     Extrae docs de dtDocumentos.
     Preferimos el link con descargaDocGeneral(uuid, tipo, nombre).
-    Misma vía Alfresco para Bases y para Documentos de Presentación de Propuestas.
+    La URL persistida es el servlet de prod1 (SdescargarArchivoAlfresco),
+    no el resolver Alfresco downloadDoc (exige sesión y no descarga).
     """
     soup = BeautifulSoup(ficha_html, "lxml")
     tbody = soup.find("tbody", id="tbFicha:dtDocumentos_data")
@@ -1202,8 +1203,8 @@ def buscar_fila_en_listado(seace, token, nid_convocatoria, fecha_ini, fecha_fin)
 
 def procesar_ficha_y_docs(seace, fila, conn=None):
     """
-    Abre la ficha y registra los documentos Alfresco disponibles SIN descargarlos.
-    - De cada doc se guarda file_code + URL de descarga (estrategia on-demand).
+    Abre la ficha y registra los documentos disponibles SIN descargarlos.
+    - De cada doc se guarda file_code + URL de SeaceWeb-PRO (descarga directa).
     - Si aún no hay ZIP de propuestas (proceso abierto), marca pendiente y sigue.
     """
     nom = fila.get("nomenclatura") or fila.get("nid_proceso") or "sin_nombre"
@@ -1225,7 +1226,7 @@ def procesar_ficha_y_docs(seace, fila, conn=None):
             d.get("etapa"), d.get("documento"), d.get("nombre_archivo")
         )
         d["file_code"] = d.get("file_code") or d.get("file_id") or ""
-        d["url_descarga"] = construir_url_alfresco(d["file_code"])
+        d["url_descarga"] = construir_url_descarga_prod2(d["file_code"])
     elegido = elegir_documento_prioridad(docs)
     cats = {d["categoria"] for d in docs}
     tiene_bases = bool(elegido)

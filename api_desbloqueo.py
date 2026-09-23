@@ -28,7 +28,7 @@ from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field, field_validator
 
 from lib_nomenclatura import normalizar_nomenclatura
-from supabase_sync import construir_url_alfresco, get_client, load_env
+from supabase_sync import construir_url_descarga_prod2, get_client, load_env
 
 load_env()
 
@@ -215,7 +215,9 @@ def buscar_documento_prioritario(nom_norm: str) -> DocumentoUsado:
 
     if mejor and mejor_score > 0:
         file_code = mejor.get("file_code") or mejor.get("file_id") or ""
-        url = (mejor.get("url_descarga") or "").strip() or construir_url_alfresco(file_code)
+        url = (mejor.get("url_descarga") or "").strip()
+        if not url or "downloadDoc" in url:
+            url = construir_url_descarga_prod2(file_code) or url
         if not url:
             raise DesbloqueoError(
                 "sin_url",
@@ -256,7 +258,9 @@ def buscar_documento_prioritario(nom_norm: str) -> DocumentoUsado:
             404,
         )
     file_code = (fila.get("file_code") or "").strip()
-    url = (fila.get("url_bases") or "").strip() or construir_url_alfresco(file_code)
+    url = (fila.get("url_bases") or "").strip()
+    if not url or "downloadDoc" in url:
+        url = construir_url_descarga_prod2(file_code) or url
     if not url:
         raise DesbloqueoError(
             "sin_documento",
