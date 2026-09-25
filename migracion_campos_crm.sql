@@ -10,6 +10,8 @@ alter table public.convocatorias add column if not exists categoria text;
 alter table public.convocatorias add column if not exists fecha_inicio_consultas timestamptz;
 alter table public.convocatorias add column if not exists fecha_fin_consultas timestamptz;
 alter table public.convocatorias add column if not exists fecha_inicio_cotizacion timestamptz;
+alter table public.convocatorias add column if not exists fecha_integracion timestamptz;
+alter table public.convocatorias add column if not exists fecha_presentacion timestamptz;
 -- fecha_fin_cotizacion ya existía; se rellena desde la etapa 2 de PROD6.
 
 -- Días transcurridos: NO se guarda. Es un valor vivo; se calcula en la vista.

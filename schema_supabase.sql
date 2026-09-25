@@ -134,6 +134,8 @@ alter table public.convocatorias add column if not exists categoria text;
 alter table public.convocatorias add column if not exists fecha_inicio_consultas timestamptz;
 alter table public.convocatorias add column if not exists fecha_fin_consultas timestamptz;
 alter table public.convocatorias add column if not exists fecha_inicio_cotizacion timestamptz;
+alter table public.convocatorias add column if not exists fecha_integracion timestamptz;
+alter table public.convocatorias add column if not exists fecha_presentacion timestamptz;
 
 create table if not exists public.cronograma_proceso (
   nomenclatura_norm text not null references public.convocatorias(nomenclatura_norm) on delete cascade,

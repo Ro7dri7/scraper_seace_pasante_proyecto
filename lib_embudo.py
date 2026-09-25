@@ -46,6 +46,62 @@ def es_estado_terminal(valor) -> bool:
     return bool(_TERMINAL.search(str(valor)))
 
 
+def estado_nunca_nulo(valor, *fechas_limite):
+    """estado nunca sale vacío/None/NaN. Si no hay texto, infiere Vigente/Cerrado."""
+    if valor is not None and valor is not False:
+        s = str(valor).strip()
+        if s and s.lower() not in ("nan", "none", "null", "nat"):
+            return s
+    limite = None
+    for raw in fechas_limite:
+        dt = _parse_dt_suelto(raw)
+        if dt and (limite is None or dt > limite):
+            limite = dt
+    if limite and limite < datetime.now(limite.tzinfo):
+        return "Cerrado"
+    return "Vigente"
+
+
+def _parse_dt_suelto(valor):
+    if valor is None or valor == "":
+        return None
+    if isinstance(valor, datetime):
+        return valor
+    s = str(valor).strip()
+    if not s or s.lower() in ("nan", "none", "null"):
+        return None
+    for fmt, cut in (
+        ("%Y-%m-%d %H:%M:%S", 19),
+        ("%Y-%m-%dT%H:%M:%S", 19),
+        ("%d/%m/%Y %H:%M", 16),
+        ("%Y-%m-%d", 10),
+        ("%d/%m/%Y", 10),
+    ):
+        try:
+            return datetime.strptime(s[:cut], fmt)
+        except ValueError:
+            continue
+    try:
+        return datetime.fromisoformat(s.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+
+
+def clasificar_nombre_etapa(nombre):
+    n = (nombre or "").lower()
+    if "integrac" in n or "consolidac" in n:
+        return "integracion"
+    if "present" in n and any(x in n for x in ("ofert", "propuest", "cotiz")):
+        return "presentacion"
+    if "present" in n and "consulta" not in n:
+        return "presentacion"
+    if "cotiz" in n:
+        return "cotizacion"
+    if "consulta" in n or "observac" in n:
+        return "consultas"
+    return None
+
+
 def horas_radar_default() -> int:
     raw = (os.environ.get("EMBUDO_HORAS_RADAR") or "72").strip()
     try:

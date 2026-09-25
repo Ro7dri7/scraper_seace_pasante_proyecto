@@ -10,7 +10,7 @@ from __future__ import annotations
 
 import os
 from datetime import datetime, timezone
-from lib_embudo import es_estado_terminal
+from lib_embudo import clasificar_nombre_etapa, es_estado_terminal, estado_nunca_nulo
 from pathlib import Path
 
 try:
@@ -122,10 +122,30 @@ def _chunks(rows, n=BATCH):
         yield rows[i : i + n]
 
 
+def _primera_fecha(*valores):
+    for valor in valores:
+        iso = _fecha_iso(valor)
+        if iso:
+            return iso
+    return None
+
+
+def _pick(d, *keys):
+    if not isinstance(d, dict):
+        return None
+    for k in keys:
+        v = d.get(k)
+        if v not in (None, ""):
+            return v
+    return None
+
+
 def _fecha_iso(valor):
-    if not valor:
+    if valor is None or valor == "":
         return None
     s = str(valor).strip()
+    if not s or s.lower() in ("nan", "none", "null"):
+        return None
     for fmt, cut in (
         ("%Y-%m-%d %H:%M:%S", 19),
         ("%Y-%m-%dT%H:%M:%S", 19),
@@ -186,20 +206,24 @@ def convocatoria_from_oece_lead(lead):
         "fuente": lead.get("Fuente") or "oece",
         "ocid": lead.get("OCID") or "",
         "ficha_url": lead.get("Ver Proceso (Portal OECE)") or "",
-        "url_bases": lead.get("URL Bases (PDF Original)") or "",
+        "url_bases": (lead.get("URL Bases (PDF Original)") or "").strip(),
         "file_code": None,
         "nid_convocatoria": None,
         "nid_proceso": None,
         "tipo_procedimiento": lead.get("Tipo Procedimiento") or "",
         "categoria": lead.get("Categoría") or lead.get("Categoria") or "",
-        "estado": lead.get("Estado") or "",
+        "estado": estado_nunca_nulo(
+            lead.get("Estado"),
+            lead.get("Fecha Fin"),
+            lead.get("Fecha Convocatoria"),
+        ),
         "updated_at": _now(),
     }
     if lead.get("Bloqueada") is True or lead.get("Bloqueada") in ("1", "true", "True"):
         row["bloqueada"] = True
     elif es_estado_terminal(row.get("estado")):
         row["bloqueada"] = True
-    return row
+    return _sanitizar_convocatoria(row)
 
 
 def proveedor_from_oece_lead(lead, ficha=None):
@@ -298,7 +322,9 @@ def upsert_seace_fila(fila, extra=None):
         "nomenclatura_norm": nom_norm,
         "nomenclatura": nom,
         "entidad": fila.get("entidad") or "",
-        "fecha_publicacion": _fecha_iso(fila.get("fecha_publicacion")),
+        "fecha_publicacion": _fecha_iso(
+            fila.get("fecha_publicacion") or extra.get("fecha_publicacion")
+        ),
         "objeto": fila.get("objeto") or "",
         "descripcion": fila.get("descripcion") or "",
         "monto": str(fila.get("vr_ve_cuantia") or ""),
@@ -310,21 +336,46 @@ def upsert_seace_fila(fila, extra=None):
         "file_code": file_code,
         "nid_convocatoria": fila.get("nid_convocatoria"),
         "nid_proceso": fila.get("nid_proceso"),
+        "estado": estado_nunca_nulo(
+            extra.get("estado") or fila.get("estado"),
+            extra.get("fecha_presentacion"),
+            extra.get("fecha_fin_cotizacion"),
+            extra.get("fecha_integracion"),
+            fila.get("fecha_publicacion"),
+        ),
+        "fecha_inicio_consultas": _fecha_iso(
+            extra.get("fecha_inicio_consultas") or fila.get("fecha_inicio_consultas")
+        ),
+        "fecha_fin_consultas": _fecha_iso(
+            extra.get("fecha_fin_consultas") or fila.get("fecha_fin_consultas")
+        ),
+        "fecha_inicio_cotizacion": _fecha_iso(
+            extra.get("fecha_inicio_cotizacion") or fila.get("fecha_inicio_cotizacion")
+        ),
+        "fecha_fin_cotizacion": _fecha_iso(
+            extra.get("fecha_fin_cotizacion") or fila.get("fecha_fin_cotizacion")
+        ),
+        "fecha_integracion": _fecha_iso(
+            extra.get("fecha_integracion") or fila.get("fecha_integracion")
+        ),
+        "fecha_presentacion": _fecha_iso(
+            extra.get("fecha_presentacion") or fila.get("fecha_presentacion")
+        ),
         "updated_at": _now(),
     }
-    if es_estado_terminal(fila.get("estado") or extra.get("estado")):
+    if es_estado_terminal(row["estado"]):
         row["bloqueada"] = True
-    upsert_rows("convocatorias", [row], "nomenclatura_norm")
+    upsert_rows("convocatorias", [_sanitizar_convocatoria(row)], "nomenclatura_norm")
     return nom_norm
 
 
 def documento_row(nom_norm, doc):
     """Fila on-demand: file_code + URL de descarga. Nunca ruta local ni bytes."""
-    file_id = doc.get("file_id") or doc.get("file_code")
+    url = (doc.get("url_descarga") or doc.get("href") or "").strip()
+    file_id = doc.get("file_id") or doc.get("file_code") or url
     if not file_id or not nom_norm:
         return None
-    file_code = doc.get("file_code") or file_id
-    url = (doc.get("url_descarga") or "").strip()
+    file_code = doc.get("file_code") or (file_id if file_id != url else "")
     if not url or "downloadDoc" in url:
         url = construir_url_descarga_prod2(file_code) or url
     return {
@@ -469,10 +520,30 @@ def _etapa_por_id(etapas, id_etapa):
 
 def _etapa_por_nombre(etapas, *needles):
     for et in etapas or []:
-        nom = (et.get("nomEtapaContrato") or "").lower()
+        nom = (et.get("nomEtapaContrato") or et.get("nombreEtapa") or "").lower()
         if any(n in nom for n in needles):
             return et
     return {}
+
+
+def _etapa_por_tipo(etapas, tipo):
+    for et in etapas or []:
+        nom = et.get("nomEtapaContrato") or et.get("nombreEtapa") or et.get("desEtapa")
+        if clasificar_nombre_etapa(nom) == tipo:
+            return et
+    return {}
+
+
+def _fecha_etapa(et, *extra_keys):
+    if not et:
+        return None
+    return _primera_fecha(
+        et.get("fecFin"),
+        et.get("fechaFin"),
+        et.get("fecIni"),
+        et.get("fechaInicio"),
+        *[et.get(k) for k in extra_keys],
+    )
 
 
 def convocatoria_from_prod6(cab, resumen=None, etapas=None, docs=None):
@@ -491,21 +562,31 @@ def convocatoria_from_prod6(cab, resumen=None, etapas=None, docs=None):
         if cab.get("montoContrato") is not None
         else resumen.get("montoContrato")
     )
-    consulta = _etapa_por_id(etapas, PROD6_ETAPA_CONSULTAS)
-    cotiza = _etapa_por_id(etapas, PROD6_ETAPA_COTIZACION)
+    consulta = (
+        _etapa_por_id(etapas, PROD6_ETAPA_CONSULTAS)
+        or _etapa_por_tipo(etapas, "consultas")
+        or _etapa_por_nombre(etapas, "consulta", "observac")
+    )
+    cotiza = (
+        _etapa_por_id(etapas, PROD6_ETAPA_COTIZACION)
+        or _etapa_por_tipo(etapas, "cotizacion")
+        or _etapa_por_nombre(etapas, "cotiz")
+    )
     integra = (
         _etapa_por_id(etapas, PROD6_ETAPA_INTEGRACION)
-        or _etapa_por_nombre(etapas, "integrac")
+        or _etapa_por_tipo(etapas, "integracion")
+        or _etapa_por_nombre(etapas, "integrac", "consolidac", "absoluc")
     )
     presenta = (
         _etapa_por_id(etapas, PROD6_ETAPA_PRESENTACION)
-        or _etapa_por_nombre(etapas, "present")
+        or _etapa_por_tipo(etapas, "presentacion")
+        or _etapa_por_nombre(etapas, "presentaci", "propuest", "ofert")
     )
     url_bases = ""
     file_code = None
     if docs:
         primero = docs[0]
-        url_bases = primero.get("url_descarga") or ""
+        url_bases = (primero.get("url_descarga") or primero.get("href") or "").strip()
         file_code = primero.get("file_code")
     # requiere_iso se omite a propósito: lo pone el DEFAULT en el INSERT y así
     # un re-upsert no pisa el estado de desbloqueo del usuario.
@@ -525,20 +606,67 @@ def convocatoria_from_prod6(cab, resumen=None, etapas=None, docs=None):
         "fuente": "PROD6",
         "ocid": None,
         "categoria": cab.get("nomObjetoContrato") or resumen.get("nomObjetoContrato") or "",
-        "estado": cab.get("nomEstadoContrato") or resumen.get("nomEstadoContrato") or "",
+        "estado": estado_nunca_nulo(
+            _pick(
+                cab,
+                "nomEstadoContrato",
+                "desEstadoContrato",
+                "estadoContrato",
+                "nomEstado",
+                "estado",
+            )
+            or _pick(resumen, "nomEstadoContrato", "desEstadoContrato", "estado"),
+            _pick(cab, "fechaPresentacionPropuestas", "fecPresentacion", "fecFinCotizacion"),
+            _pick(resumen, "fecFinCotizacion"),
+            presenta.get("fecFin"),
+            cotiza.get("fecFin"),
+        ),
         "id_contrato": None if id_contrato is None else str(id_contrato),
         "tipo_procedimiento": "Contratación menor (≤ 8 UIT)",
-        "fecha_inicio_consultas": _fecha_iso(consulta.get("fecIni")),
-        "fecha_fin_consultas": _fecha_iso(consulta.get("fecFin")),
-        "fecha_inicio_cotizacion": _fecha_iso(cotiza.get("fecIni")),
-        "fecha_fin_cotizacion": _fecha_iso(
-            cotiza.get("fecFin") or resumen.get("fecFinCotizacion")
+        "fecha_inicio_consultas": _primera_fecha(
+            consulta.get("fecIni"), consulta.get("fechaInicio")
         ),
-        "fecha_integracion": _fecha_iso(
-            integra.get("fecFin") or integra.get("fecIni")
+        "fecha_fin_consultas": _primera_fecha(
+            consulta.get("fecFin"), consulta.get("fechaFin")
         ),
-        "fecha_presentacion": _fecha_iso(
-            presenta.get("fecFin") or presenta.get("fecIni")
+        "fecha_inicio_cotizacion": _primera_fecha(
+            cotiza.get("fecIni"), cotiza.get("fechaInicio")
+        ),
+        "fecha_fin_cotizacion": _primera_fecha(
+            cotiza.get("fecFin"),
+            cotiza.get("fechaFin"),
+            resumen.get("fecFinCotizacion"),
+            cab.get("fecFinCotizacion"),
+        ),
+        "fecha_integracion": _primera_fecha(
+            _fecha_etapa(integra),
+            _pick(
+                cab,
+                "fechaIntegracion",
+                "fechaIntegracionBases",
+                "fecIntegracion",
+                "fecIntegracionBases",
+                "fecha_integracion",
+            ),
+            _pick(resumen, "fechaIntegracion", "fecIntegracion"),
+        ),
+        "fecha_presentacion": _primera_fecha(
+            _fecha_etapa(presenta),
+            _pick(
+                cab,
+                "fechaPresentacionPropuestas",
+                "fechaPresentacion",
+                "fecPresentacionPropuestas",
+                "fecPresentacion",
+                "fecha_presentacion",
+            ),
+            _pick(
+                resumen,
+                "fechaPresentacionPropuestas",
+                "fecPresentacion",
+                "fecFinCotizacion",
+            ),
+            cotiza.get("fecFin"),
         ),
         "ficha_url": (
             f"https://prod6.seace.gob.pe/buscador-publico/contrataciones/{id_contrato}"
@@ -586,9 +714,12 @@ def documentos_from_prod6(nom_norm, docs):
             "documento": doc.get("documento") or "Requerimiento / Bases",
             "nombre_archivo": doc.get("nombre_archivo") or "",
             "file_code": str(doc.get("file_code") or file_id),
-            "url_descarga": doc.get("url_descarga") or (
-                f"{PROD6_ARCHIVO_BASE}/{file_id}"
-            ),
+            "url_descarga": (
+                doc.get("url_descarga")
+                or doc.get("href")
+                or doc.get("url")
+                or ""
+            ).strip(),
             "updated_at": _now(),
         })
     return filas

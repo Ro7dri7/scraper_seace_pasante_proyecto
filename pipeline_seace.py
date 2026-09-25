@@ -8,8 +8,13 @@ Pasos:
   4) Ubicación SUNAT
   5) Delta SEACE PROD2 (2Captcha + dedup nomenclaturas + Supabase)
 
-El flujo maestro de las 3 fuentes (OECE → PROD2 → PROD6) vive en main.py, que
+El flujo maestro de las 3 fuentes (OECE → PROD6 → PROD2) vive en main.py, que
 invoca este pipeline con --skip-seace para la parte OECE.
+
+Reglas de persistencia (supabase_sync / extractores):
+  - estado nunca se upserta vacío: fallback Vigente/Cerrado por fechas.
+  - fecha_integracion y fecha_presentacion se mapean desde cronograma/API.
+  - url_bases / url_descarga se guardan tal cual (sin resolver alf_ticket).
 """
 from __future__ import annotations
 

@@ -47,7 +47,7 @@ from captcha_2captcha import (
     extraer_sitekey,
     resolver_recaptcha,
 )
-from lib_embudo import horas_radar_default
+from lib_embudo import clasificar_nombre_etapa, horas_radar_default
 from lib_nomenclatura import normalizar_nomenclatura
 from proxy_iproyal import aplicar_proxy, log_proxy_status, proxy_para_2captcha
 from supabase_sync import construir_url_descarga_prod2
@@ -166,7 +166,7 @@ def _montar_adaptador_reintentos(session):
 # Cliente SEACE
 # ---------------------------------------------------------------------------
 class Seace:
-    def __init__(self, host=HOST):
+    def __init__(self, host=HOST, calentar=True):
         self.host = host
         self.page = f"{host}/seacebus-uiwd-pub/buscadorPublico/buscadorPublico.xhtml"
         self.s = requests.Session()
@@ -185,7 +185,21 @@ class Seace:
         self._vs = None
         self.filtros = {}
         self.sitekey = None
-        self.refresh()
+        if calentar:
+            self.refresh()
+
+    def sesion_caliente(self):
+        """True si ya hay JSESSIONID + ViewState del buscador."""
+        return bool(self._vs) and bool(self.s.cookies.get("JSESSIONID"))
+
+    def _log_sesion(self, prefijo=""):
+        jsid = self.s.cookies.get("JSESSIONID") or ""
+        vs = (self._vs or "")[:20]
+        print(
+            f"{prefijo}sesión JSESSIONID="
+            f"{(jsid[:10] + '…') if jsid else 'AUSENTE'} "
+            f"ViewState={vs + '…' if vs else 'AUSENTE'}"
+        )
 
     def _http(self, method, url, **kwargs):
         """GET/POST: timeout obligatorio + reintentos. No traga KeyboardInterrupt."""
@@ -230,6 +244,7 @@ class Seace:
         print(f"[+] ViewState: {self._vs[:20]}...")
         if self.sitekey:
             print(f"[+] reCAPTCHA v3 sitekey: {self.sitekey[:16]}...")
+        self._log_sesion("[+] Buscador caliente — ")
 
     def find_select(self, option_label):
         form = self.soup.find("form", id=FORM)
@@ -417,8 +432,14 @@ class Seace:
         r = self._http(
             "POST", self.page, data=data, headers=headers, allow_redirects=False,
         )
-        ficha_markers = ("tbFicha:dtDocumentos", "fichaSeleccion", "dtDocumentos_data")
+        ficha_markers = (
+            "tbFicha:dtCronograma",
+            "tbFicha:dtDocumentos",
+            "fichaSeleccion",
+            "dtDocumentos_data",
+        )
         if r.status_code == 200 and any(m in (r.text or "") for m in ficha_markers):
+            _validar_html_ficha(r.status_code, r.text, r.url or self.page)
             return r.url or self.page, r.text
 
         if r.status_code not in (301, 302, 303, 307, 308):
@@ -433,15 +454,97 @@ class Seace:
         elif loc.startswith("/"):
             loc = self.host + loc
         if "fichaSeleccion.xhtml" not in loc:
+            print(f"[!] Redirect 302 a URL inesperada (no fichaSeleccion): {loc}")
             raise RuntimeError(f"Redirect inesperado: {loc}")
 
-        rf = self._http("GET", loc, headers={
-            "User-Agent": self.s.headers.get("User-Agent"),
-            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-            "Referer": self.page,
-        })
+        # Misma Session (JSESSIONID). allow_redirects=False para detectar 302 extras.
+        rf = self._http(
+            "GET",
+            loc,
+            headers={
+                "User-Agent": self.s.headers.get("User-Agent"),
+                "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+                "Referer": self.page,
+            },
+            allow_redirects=False,
+        )
+        if rf.status_code in (301, 302, 303, 307, 308):
+            loc2 = rf.headers.get("Location") or ""
+            print(f"[!] GET ficha devolvió {rf.status_code} → {loc2}; se sigue la Location")
+            if loc2.startswith("/"):
+                loc2 = self.host + loc2
+            rf = self._http(
+                "GET",
+                loc2,
+                headers={
+                    "User-Agent": self.s.headers.get("User-Agent"),
+                    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+                    "Referer": loc,
+                },
+            )
+            loc = loc2
+        if rf.status_code != 200:
+            print(f"[!] GET fichaSeleccion HTTP {rf.status_code} (se esperaba 200) {loc}")
         rf.raise_for_status()
+        _validar_html_ficha(rf.status_code, rf.text, loc)
         return loc, rf.text
+
+    def get_ficha_url(self, url):
+        """GET fichaSeleccion con la Session ya calentada (JSESSIONID + ViewState)."""
+        if not self.sesion_caliente():
+            print("[*] Sesión fría: GET buscadorPublico.xhtml (cookies + ViewState)")
+            self.refresh()
+        if not self.sesion_caliente():
+            raise RuntimeError(
+                "No se pudo calentar la sesión JSF (falta JSESSIONID o ViewState)."
+            )
+        self._log_sesion("[*] GET ficha con ")
+        r = self._http(
+            "GET",
+            url,
+            headers={
+                "User-Agent": self.s.headers.get("User-Agent"),
+                "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+                "Referer": self.page,
+            },
+            allow_redirects=False,
+        )
+        if r.status_code in (301, 302, 303, 307, 308):
+            loc = r.headers.get("Location") or ""
+            loc_abs = loc if loc.startswith("http") else (
+                self.host + loc if loc.startswith("/") else loc
+            )
+            print(f"[!] GET ficha {r.status_code} → {loc_abs}")
+            if "buscadorPublico" in loc_abs:
+                raise RuntimeError(
+                    "Redirección detectada o Ficha no encontrada. "
+                    f"HTML descargado: el servidor mandó a {loc_abs}"
+                )
+            r = self._http(
+                "GET",
+                loc_abs,
+                headers={
+                    "User-Agent": self.s.headers.get("User-Agent"),
+                    "Referer": url,
+                },
+                allow_redirects=False,
+            )
+            url = loc_abs
+            if r.status_code in (301, 302, 303, 307, 308):
+                loc2 = r.headers.get("Location") or ""
+                raise RuntimeError(
+                    "Redirección detectada o Ficha no encontrada. "
+                    f"HTML descargado: segundo 302 → {loc2}"
+                )
+        r.raise_for_status()
+        if "buscadorPublico" in (r.url or url) and "fichaSeleccion" not in (r.url or url):
+            titulo = _titulo_html(r.text)
+            raise RuntimeError(
+                "Redirección detectada o Ficha no encontrada. "
+                f"HTML descargado: {titulo}"
+            )
+        _validar_html_ficha(r.status_code, r.text, url)
+        return url, r.text
 
     def descargar_archivo(self, url, dest=None):
         """GET de Alfresco/SEACE con el mismo timeout y reintentos. No se usa
@@ -668,12 +771,245 @@ def parse_resultados(xml_response):
     return rows, total
 
 
+def _absolutizar_url(href):
+    href = (href or "").strip()
+    if not href or href.startswith("javascript") or href in ("#", "void(0)"):
+        return ""
+    if href.startswith("//"):
+        return "https:" + href
+    if href.startswith("/"):
+        return HOST.rstrip("/") + href
+    if href.startswith("http://") or href.startswith("https://"):
+        return href
+    return ""
+
+
+def parse_estado_ficha(ficha_html):
+    """Estado del proceso en la ficha JSF (nunca se asume vacío aguas abajo)."""
+    soup = BeautifulSoup(ficha_html, "lxml")
+    for lab in soup.find_all(["label", "span", "td", "th"]):
+        txt = lab.get_text(" ", strip=True).lower()
+        if txt not in ("estado", "estado del proceso", "estado proceso") and not (
+            txt.startswith("estado") and len(txt) < 28
+        ):
+            continue
+        nxt = lab.find_next(["span", "td", "div", "input"])
+        if nxt is None:
+            continue
+        if nxt.name == "input":
+            val = (nxt.get("value") or "").strip()
+        else:
+            val = nxt.get_text(" ", strip=True)
+        if val and val.lower() not in ("estado", "estado del proceso"):
+            return val
+    m = re.search(
+        r"Estado(?:\s+del\s+proceso)?\s*[:\-]\s*([A-Za-zÁÉÍÓÚÜÑáéíóúüñ ]{3,40})",
+        ficha_html,
+        re.I,
+    )
+    return (m.group(1).strip() if m else "") or ""
+
+
+CRONO_MARKER = "tbFicha:dtCronograma"
+FICHA_DRY_RUN_URL = (
+    "https://prod2.seace.gob.pe/seacebus-uiwd-pub/fichaSeleccion/"
+    "fichaSeleccion.xhtml?id=eef2f265-c214-4511-bdb1-678827e4d090&ptoRetorno=LOCAL"
+)
+
+
+def _validar_html_ficha(status, html, url=""):
+    html = html or ""
+    ok = True
+    if status != 200:
+        print(f"[!] Ficha HTTP {status} (se esperaba 200) {url}")
+        ok = False
+    if CRONO_MARKER not in html:
+        print(
+            f"[!] HTML de ficha incompleto: no contiene '{CRONO_MARKER}' {url}"
+        )
+        ok = False
+    return ok
+
+
+def _nombre_etapa_celda(td):
+    """Primer nodo de texto de la celda (ignora <br> y <span> secundarios)."""
+    for node in td.contents:
+        if isinstance(node, str):
+            t = " ".join(node.split())
+            if t:
+                return t
+        if getattr(node, "name", None) == "br":
+            break
+    linea = td.get_text("\n", strip=True).split("\n")[0]
+    return " ".join(linea.split())
+
+
+def _parse_fecha_cronograma(texto):
+    raw = " ".join((texto or "").split())
+    m = re.search(r"(\d{2}/\d{2}/\d{4}(?:\s+\d{1,2}:\d{2})?)", raw)
+    if not m:
+        return None, None
+    s = m.group(1)
+    for fmt in ("%d/%m/%Y %H:%M", "%d/%m/%Y"):
+        try:
+            dt = datetime.strptime(s, fmt)
+            return dt, dt.isoformat()
+        except ValueError:
+            continue
+    return None, None
+
+
+def _clave_etapa_prod2(nombre):
+    n = (nombre or "").lower()
+    n = re.sub(r"\s+", " ", n)
+    if "buena pro" in n or (n.startswith("otorg") and "pro" in n):
+        return "otorgamiento_buena_pro"
+    if "integrac" in n:
+        return "integracion_bases"
+    if "present" in n and "propuest" in n:
+        return "presentacion_propuestas"
+    if "calific" in n or "evaluac" in n:
+        return "calificacion_evaluacion"
+    if "absoluc" in n:
+        return "absolucion_consultas"
+    if "formulac" in n or ("consulta" in n and "observ" in n):
+        return "formulacion_consultas"
+    if "registro" in n and "particip" in n:
+        return "registro_participantes"
+    if n.startswith("convocatoria"):
+        return "convocatoria"
+    return clasificar_nombre_etapa(nombre) or "otra"
+
+
+def inferir_etapa_actual(etapas, ahora=None):
+    ahora = ahora or datetime.now()
+    vigente = None
+    ultima = None
+    for et in etapas:
+        ini, fin = et.get("fecha_inicio_dt"), et.get("fecha_fin_dt")
+        if ini and fin:
+            if ini <= ahora <= fin:
+                vigente = et["nombre"]
+                break
+            if ahora > fin:
+                ultima = et["nombre"]
+        elif ini and fin is None and ahora >= ini:
+            vigente = et["nombre"]
+        elif fin and ini is None and ahora <= fin:
+            vigente = et["nombre"]
+    if vigente:
+        return vigente
+    if ultima:
+        return ultima
+    if etapas:
+        return etapas[0]["nombre"]
+    return "Sin cronograma"
+
+
+def _titulo_html(html_doc):
+    soup = BeautifulSoup(html_doc or "", "lxml")
+    tag = soup.find("title")
+    if tag and tag.get_text(strip=True):
+        return tag.get_text(" ", strip=True)
+    h1 = soup.find("h1")
+    return (h1.get_text(" ", strip=True) if h1 else "") or "(sin título)"
+
+
+def extraer_cronograma_prod2(html_doc):
+    """
+    Parser del tbody#tbFicha:dtCronograma_data (3 celdas: etapa, inicio, fin).
+    Devuelve etapas (8 hitos) + columnas listas para convocatorias.
+    """
+    html_doc = html_doc or ""
+    if "tbFicha:dtCronograma_data" not in html_doc:
+        titulo = _titulo_html(html_doc)
+        msg = (
+            "Redirección detectada o Ficha no encontrada. "
+            f"HTML descargado: {titulo}"
+        )
+        print(f"[!] Error crítico: {msg}")
+        raise ValueError(msg)
+    soup = BeautifulSoup(html_doc, "lxml")
+    tbody = soup.find("tbody", id="tbFicha:dtCronograma_data")
+    if not tbody:
+        tbody = soup.find("tbody", id=re.compile(r"dtCronograma_data"))
+    etapas = []
+    if tbody:
+        for tr in tbody.find_all("tr"):
+            if "ui-datatable-empty-message" in (tr.get("class") or []):
+                continue
+            tds = tr.find_all("td", recursive=False)
+            if len(tds) < 3:
+                tds = tr.find_all("td")
+            if len(tds) < 3:
+                continue
+            nombre = _nombre_etapa_celda(tds[0])
+            if not nombre:
+                continue
+            ini_dt, ini_iso = _parse_fecha_cronograma(tds[1].get_text(" ", strip=True))
+            fin_dt, fin_iso = _parse_fecha_cronograma(tds[2].get_text(" ", strip=True))
+            etapas.append({
+                "clave": _clave_etapa_prod2(nombre),
+                "nombre": nombre,
+                "fecha_inicio": ini_iso,
+                "fecha_fin": fin_iso,
+                "fecha_inicio_dt": ini_dt,
+                "fecha_fin_dt": fin_dt,
+            })
+
+    por = {et["clave"]: et for et in etapas}
+    conv = por.get("convocatoria") or {}
+    form = por.get("formulacion_consultas") or {}
+    abso = por.get("absolucion_consultas") or {}
+    inte = por.get("integracion_bases") or {}
+    pres = por.get("presentacion_propuestas") or {}
+    otor = por.get("otorgamiento_buena_pro") or {}
+
+    mapeo = {
+        "fecha_publicacion": conv.get("fecha_inicio") or conv.get("fecha_fin"),
+        "fecha_inicio_consultas": form.get("fecha_inicio"),
+        "fecha_fin_consultas": abso.get("fecha_fin") or abso.get("fecha_inicio"),
+        "fecha_integracion": inte.get("fecha_fin") or inte.get("fecha_inicio"),
+        "fecha_presentacion": pres.get("fecha_inicio") or pres.get("fecha_fin"),
+        "fecha_fin_cotizacion": otor.get("fecha_fin") or otor.get("fecha_inicio"),
+        "etapa_actual": inferir_etapa_actual(etapas),
+    }
+    return {
+        "etapas": [
+            {
+                "clave": et["clave"],
+                "nombre": et["nombre"],
+                "fecha_inicio": et["fecha_inicio"],
+                "fecha_fin": et["fecha_fin"],
+            }
+            for et in etapas
+        ],
+        "mapeo_convocatorias": mapeo,
+        **mapeo,
+    }
+
+
+def parse_cronograma_ficha(ficha_html):
+    """Compat: solo las columnas que upsert_seace_fila escribe en convocatorias."""
+    data = extraer_cronograma_prod2(ficha_html)
+    return {
+        "fecha_publicacion": data.get("fecha_publicacion"),
+        "fecha_inicio_consultas": data.get("fecha_inicio_consultas"),
+        "fecha_fin_consultas": data.get("fecha_fin_consultas"),
+        "fecha_inicio_cotizacion": None,
+        "fecha_fin_cotizacion": data.get("fecha_fin_cotizacion"),
+        "fecha_integracion": data.get("fecha_integracion"),
+        "fecha_presentacion": data.get("fecha_presentacion"),
+        "etapa_actual": data.get("etapa_actual"),
+    }
+
+
 def parse_documentos(ficha_html):
     """
     Extrae docs de dtDocumentos.
-    Preferimos el link con descargaDocGeneral(uuid, tipo, nombre).
-    La URL persistida es el servlet de prod1 (SdescargarArchivoAlfresco),
-    no el resolver Alfresco downloadDoc (exige sesión y no descarga).
+    Preferimos href directo o descargaDocGeneral(uuid, tipo, nombre).
+    Si no hay URL usable, se arma el servlet prod1 (SdescargarArchivoAlfresco),
+    no el resolver Alfresco downloadDoc.
     """
     soup = BeautifulSoup(ficha_html, "lxml")
     tbody = soup.find("tbody", id="tbFicha:dtDocumentos_data")
@@ -688,6 +1024,7 @@ def parse_documentos(ficha_html):
                 "n": None, "etapa": None, "documento": None,
                 "file_id": uuid, "tipo": tipo, "nombre_archivo": nombre,
                 "fuente": "js",
+                "url_descarga": "",
                 "categoria": clasificar_documento(None, None, nombre),
             })
         return docs
@@ -699,9 +1036,11 @@ def parse_documentos(ficha_html):
         if len(tds) < 4:
             continue
         file_id = tipo = nombre = source = file_code = None
+        url_descarga = ""
         for a in tr.find_all("a"):
             oc = a.get("onclick") or ""
             href = a.get("href") or ""
+            url_descarga = url_descarga or _absolutizar_url(href)
             m = re.search(
                 r"descargaDocGeneral\('([^']*)','([^']*)','([^']*)'\)", oc
             )
@@ -711,10 +1050,12 @@ def parse_documentos(ficha_html):
             mcode = re.search(r"fileCode=([A-Za-z0-9_\-]+)", oc + " " + href)
             if mcode:
                 file_code = mcode.group(1)
-            if m:
+            if url_descarga or m:
                 break
         if not file_id and file_code:
             file_id = file_code
+        if not file_id and url_descarga:
+            file_id = url_descarga
         if not file_id:
             continue
         etapa = tds[1].get_text(" ", strip=True)
@@ -724,10 +1065,11 @@ def parse_documentos(ficha_html):
             "etapa": etapa,
             "documento": documento,
             "file_id": file_id,
-            "file_code": file_code or file_id,
+            "file_code": file_code or (file_id if file_id != url_descarga else ""),
             "tipo": tipo,
             "nombre_archivo": nombre,
             "fuente": source,
+            "url_descarga": url_descarga,
             "fecha": tds[4].get_text(" ", strip=True) if len(tds) > 4 else None,
             "categoria": clasificar_documento(etapa, documento, nombre),
         })
@@ -1221,12 +1563,23 @@ def procesar_ficha_y_docs(seace, fila, conn=None):
         )
 
     docs = parse_documentos(html)
+    crono_full = extraer_cronograma_prod2(html)
+    crono = parse_cronograma_ficha(html)
+    estado_ficha = parse_estado_ficha(html) or crono.get("etapa_actual")
+    print(
+        f"  cronograma={len(crono_full.get('etapas') or [])} etapas | "
+        f"actual={crono.get('etapa_actual')}"
+    )
     for d in docs:
         d["categoria"] = d.get("categoria") or clasificar_documento(
             d.get("etapa"), d.get("documento"), d.get("nombre_archivo")
         )
         d["file_code"] = d.get("file_code") or d.get("file_id") or ""
-        d["url_descarga"] = construir_url_descarga_prod2(d["file_code"])
+        href = (d.get("url_descarga") or "").strip()
+        if href and "downloadDoc" not in href:
+            d["url_descarga"] = href
+        else:
+            d["url_descarga"] = construir_url_descarga_prod2(d["file_code"]) or href
     elegido = elegir_documento_prioridad(docs)
     cats = {d["categoria"] for d in docs}
     tiene_bases = bool(elegido)
@@ -1306,6 +1659,8 @@ def procesar_ficha_y_docs(seace, fila, conn=None):
             "ficha_url": url,
             "url_bases": url_bases,
             "file_code": file_code,
+            "estado": estado_ficha or fila.get("estado"),
+            **crono,
         })
         if nom_norm:
             upsert_documentos(nom_norm, docs)
@@ -1335,11 +1690,53 @@ def parse_args():
         default=None,
         help="Ventana de publicación en horas (default EMBUDO_HORAS_RADAR o 72)",
     )
+    p.add_argument(
+        "--dry-run-cronograma",
+        action="store_true",
+        help="Solo GET de una fichaSeleccion y parsea las 8 etapas (no toca BD)",
+    )
+    p.add_argument(
+        "--ficha-url",
+        default=FICHA_DRY_RUN_URL,
+        help="URL de fichaSeleccion.xhtml para --dry-run-cronograma",
+    )
     return p.parse_args()
+
+
+def dry_run_cronograma(url=None):
+    """
+    No usa requests.get suelto. Calienta Seace (buscador + JSESSIONID + ViewState)
+    y recién entonces pide fichaSeleccion.xhtml con esa misma Session.
+    """
+    url = url or FICHA_DRY_RUN_URL
+    print(f"[*] Dry-run cronograma PROD2 → {url}")
+    print("[*] 1/2 Calentando sesión JSF: GET buscadorPublico.xhtml")
+    seace = Seace(calentar=False)
+    seace.refresh()
+    if not seace.sesion_caliente():
+        raise SystemExit(
+            "[-] Sesión no inicializada: falta JSESSIONID o ViewState."
+        )
+    print("[*] 2/2 GET fichaSeleccion.xhtml con la sesión viva")
+    final_url, html = seace.get_ficha_url(url)
+    data = extraer_cronograma_prod2(html)
+    payload = {
+        "url": final_url,
+        "html_ok": "tbFicha:dtCronograma_data" in (html or ""),
+        "html_bytes": len(html or ""),
+        "etapas": data.get("etapas") or [],
+        "mapeo_convocatorias": data.get("mapeo_convocatorias") or {},
+        "etapa_actual": data.get("etapa_actual"),
+    }
+    print(json.dumps(payload, ensure_ascii=False, indent=2))
+    return payload
 
 
 if __name__ == "__main__":
     args = parse_args()
+    if args.dry_run_cronograma:
+        dry_run_cronograma(args.ficha_url)
+        sys.exit(0)
     detectar_ip_publica()
     known_oece = cargar_nomenclaturas_oece(args.nomenclaturas_file)
     objeto = args.objeto

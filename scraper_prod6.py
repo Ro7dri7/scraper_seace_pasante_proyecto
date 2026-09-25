@@ -202,13 +202,23 @@ def listar_archivos_requerimiento(session, id_contrato):
             or row.get("docSolicitado")
             or f"requerimiento_{id_contrato}.zip"
         )
+        url_directa = (
+            row.get("urlDescarga")
+            or row.get("url_descarga")
+            or row.get("urlArchivo")
+            or row.get("url")
+            or row.get("rutaDescarga")
+            or row.get("linkDescarga")
+            or ""
+        )
+        url_directa = str(url_directa).strip()
         docs.append({
             "file_id": f"prod6-{file_id}",
             "file_code": str(file_id),
             "categoria": "requerimiento",
             "documento": row.get("descripcion") or "Requerimiento / Bases",
             "nombre_archivo": nombre,
-            "url_descarga": f"{URL_ARCHIVOS}/descargar-archivo-contrato/{file_id}",
+            "url_descarga": url_directa,
         })
     return docs
 

@@ -22,7 +22,7 @@ from collections import defaultdict
 from pathlib import Path
 
 from lib_nomenclatura import extraer_nomenclatura
-from lib_embudo import clasificar_estado_oece
+from lib_embudo import clasificar_estado_oece, estado_nunca_nulo
 
 # Desactivar verificación estricta de SSL si hay problemas con certificados gubernamentales
 SSL_CONTEXT = ssl.create_default_context()
@@ -331,6 +331,7 @@ def parse_oece_data(z, min_days_old=0, max_records=None, target_month=None):
             estado_es, bloqueada = clasificar_estado_oece(
                 status_raw, tiene_ganador=(ocid in ocids_con_ganador)
             )
+            estado_es = estado_nunca_nulo(estado_es, pub_date_clean)
             if bloqueada:
                 procesos_bloqueados += 1
 
